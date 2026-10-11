@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import glob
+import time
+import argparse
+import subprocess
+import urllib.request
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+JACKETT_URL = "http://127.0.0.1:9117"
+QBITTORRENT_URL = "http://127.0.0.1:8080"
+JACKETT_CONFIG = os.path.expanduser("~/.config/Jackett/ServerConfig.json")
+
+def format_size(bytes_val):
+    try:
+        val = float(bytes_val)
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if val < 1024.0:
+                return f"{val:.1f} {unit}"
+            val /= 1024.0
+        return f"{val:.1f} PB"
+    except Exception:
+        return "N/A"
+
+def get_category_badge(cat_desc, cat_ids):
+    desc = (cat_desc or "").lower()
+    ids = cat_ids or []
+    if "movie" in desc or any(2000 <= c < 3000 for c in ids):
+        return "🎬 Película", "movies"
+    if "tv" in desc or "serie" in desc or any(5000 <= c < 6000 for c in ids):
+        return "📺 Serie", "tv"
+    if "game" in desc or "juego" in desc or any(1000 <= c < 2000 or c == 4050 for c in ids):
+        return "🎮 Juego", "games"
+    if "audio" in desc or "music" in desc or "lossless" in desc or any(3000 <= c < 4000 for c in ids):
+        return "🎵 Música", "music"
+    if "book" in desc or "libro" in desc or any(7000 <= c < 8000 for c in ids):
+        return "📚 Libro", "books"
+    if "xxx" in desc or any(6000 <= c < 7000 for c in ids):
+        return "🔞 Adulto", "xxx"
+    return "📦 General", "other"
+
+# Subcommand: Preview handler for fzf
+if len(sys.argv) >= 2 and sys.argv[1] == "__preview__":
+    raw = " ".join(sys.argv[2:])
+    if "\t" in raw:
+        payload = raw.split("\t")[1]
+        try:
+            data = json.loads(payload)
+            seeds = int(data.get('Seeders') or 0)
+            peers = int(data.get('Peers') or 0)
+            badge, _ = get_category_badge(data.get('CategoryDesc'), data.get('Category'))
+
+            if seeds >= 50:
+                health = f"\x1b[1;32m🌱 {seeds} semillas (Salud Excelente - Máxima velocidad)\x1b[0m"
+            elif seeds >= 15:
+                health = f"\x1b[32m🌿 {seeds} semillas (Salud Buena)\x1b[0m"
+            elif seeds >= 1:
+                health = f"\x1b[33m⚠️ {seeds} semillas (Pocas semillas)\x1b[0m"
+            else:
+                health = f"\x1b[31m💀 0 semillas (Posiblemente inactivo)\x1b[0m"
+
+            print("\x1b[1;36m========================================================\x1b[0m")
+            print(f"\x1b[1;32mTITULO:\x1b[0m  \x1b[1m{data.get('Title')}\x1b[0m")
+            print("\x1b[1;36m========================================================\x1b[0m")
+            print(f"\x1b[1mCategoría:\x1b[0m  \x1b[1m{badge}\x1b[0m \x1b[90m({data.get('CategoryDesc', 'General')})\x1b[0m")
+            print(f"\x1b[1mTracker:\x1b[0m    \x1b[35m{data.get('Tracker')}\x1b[0m")
+            print(f"\x1b[1mEnjambre:\x1b[0m   {health} | \x1b[33m👥 {peers} sanguijuelas\x1b[0m")
+            print(f"\x1b[1mTamaño:\x1b[0m     \x1b[36m📦 {format_size(data.get('Size', 0))}\x1b[0m")
+            print(f"\x1b[1mPublicado:\x1b[0m  {data.get('PublishDate', 'N/A')[:19]}")
+            print(f"\x1b[1mArchivos:\x1b[0m   {data.get('Files', 'N/A')}")
+            
+            link = data.get("MagnetUri") or data.get("Link") or ""
+            if link.startswith("magnet:"):
+                # Extract infohash if possible
+                import re
+                ih_match = re.search(r'urn:btih:([a-zA-Z0-9]+)', link)
+                if ih_match:
+                    print(f"\x1b[1mInfoHash:\x1b[0m  \x1b[90m{ih_match.group(1)}\x1b[0m")
+
+            print("\n\x1b[1;34mAtajos disponibles:\x1b[0m")
+            print("  \x1b[1m[ENTER]\x1b[0m   -> Enviar directo a qBittorrent")
+            print("  \x1b[1m[CTRL+Y]\x1b[0m  -> Copiar enlace Magnet al portapapeles")
+            print("  \x1b[1m[ESC]\x1b[0m     -> Salir")
+            print("\x1b[90mTip: Puedes escribir !cam o !telesync para excluir palabras.\x1b[0m")
+        except Exception as e:
+            print("Error cargando detalles:", e)
+    sys.exit(0)
+
+# Subcommand: Copy magnet handler for fzf
+if len(sys.argv) >= 2 and sys.argv[1] == "__copy_magnet__":
+    raw = " ".join(sys.argv[2:])
+    if "\t" in raw:
+        payload = raw.split("\t")[1]
+        try:
+            data = json.loads(payload)
+            link = data.get("MagnetUri") or data.get("Link")
+            if link:
+                subprocess.run(["wl-copy", link], check=False)
+        except Exception:
+            pass
+    sys.exit(0)
+
+def get_jackett_api_key():
+    if not os.path.exists(JACKETT_CONFIG):
+        print(f"\x1b[1;31mError: No se encontró la configuración de Jackett en {JACKETT_CONFIG}\x1b[0m")
+        sys.exit(1)
+    with open(JACKETT_CONFIG, "r", encoding="utf-8") as f:
+        return json.load(f).get("APIKey", "")
+
+def get_configured_indexers():
+    indexers_dir = os.path.expanduser("~/.config/Jackett/Indexers")
+    files = glob.glob(os.path.join(indexers_dir, "*.json"))
+    return [os.path.splitext(os.path.basename(f))[0] for f in files if not f.endswith(".bak")]
+
+def search_indexer(indexer, query, api_key):
+    encoded_query = urllib.parse.quote(query)
+    url = f"{JACKETT_URL}/api/v2.0/indexers/{indexer}/results?apikey={api_key}&Query={encoded_query}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=4.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            return data.get("Results", [])
+    except Exception:
+        return []
+
+def add_to_qbittorrent(download_url):
+    add_url = f"{QBITTORRENT_URL}/api/v2/torrents/add"
+    post_data = urllib.parse.urlencode({"urls": download_url}).encode("utf-8")
+    req = urllib.request.Request(add_url, data=post_data, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
+    except Exception as e:
+        print(f"\x1b[1;31mError al conectar con qBittorrent: {e}\x1b[0m")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="qJackett: Buscador interactivo TUI de torrents conectado a Jackett y qBittorrent",
+        usage="%(prog)s [opciones] [termino_de_busqueda]"
+    )
+    parser.add_argument("query", nargs="*", help="Término o título a buscar")
+    parser.add_argument("-c", "--category", choices=["movies", "tv", "games", "music", "books", "xxx"], help="Filtrar por categoría")
+    parser.add_argument("-s", "--min-seeds", type=int, default=0, help="Mínimo de semillas (seeders)")
+    parser.add_argument("-x", "--exclude", help="Palabras a excluir separadas por comas (ej. cam,ts,latino)")
+
+    args = parser.parse_args()
+
+    api_key = get_jackett_api_key()
+    indexers = get_configured_indexers()
+
+    query_str = " ".join(args.query).strip() if args.query else ""
+
+    if not query_str:
+        print("\x1b[1;36m=======================================================\x1b[0m")
+        print("\x1b[1;32m      ⚡ QJACKETT TUI: BUSCADOR TURBO DE TORRENTS     \x1b[0m")
+        print("\x1b[1;36m=======================================================\x1b[0m")
+        try:
+            query_str = input("\x1b[1m🔍 Introduce qué quieres buscar:\x1b[0m ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelado.")
+            return
+
+    if not query_str:
+        print("Búsqueda vacía. Saliendo.")
+        return
+
+    # Exclusion list
+    exclude_terms = [t.strip().lower() for t in args.exclude.split(",")] if args.exclude else []
+
+    print(f"\x1b[90mConsultando {len(indexers)} trackers en paralelo...\x1b[0m", end="\r", flush=True)
+
+    results = []
+    seen_links = set()
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = {executor.submit(search_indexer, idx, query_str, api_key): idx for idx in indexers}
+        for future in as_completed(futures):
+            res_list = future.result()
+            for r in res_list:
+                link = r.get("MagnetUri") or r.get("Link")
+                if not link or link in seen_links:
+                    continue
+
+                seeds = int(r.get("Seeders") or 0)
+                if seeds < args.min_seeds:
+                    continue
+
+                title = r.get("Title", "")
+                lower_title = title.lower()
+
+                # Exclude terms filter
+                if any(ex in lower_title for ex in exclude_terms):
+                    continue
+
+                badge, cat_key = get_category_badge(r.get("CategoryDesc"), r.get("Category"))
+                if args.category and cat_key != args.category:
+                    continue
+
+                seen_links.add(link)
+                r["_badge"] = badge
+                r["_cat_key"] = cat_key
+                results.append(r)
+
+    elapsed = time.time() - t0
+
+    if not results:
+        print(f"\x1b[1;33mNo se encontraron torrents para '{query_str}' ({elapsed:.1f}s).\x1b[0m")
+        return
+
+    # Sort results by Seeders descending
+    results.sort(key=lambda x: int(x.get("Seeders") or 0), reverse=True)
+
+    print(f"\x1b[1;32mEncontrados {len(results)} resultados en {elapsed:.2f}s.\x1b[0m Abriendo TUI...")
+
+    # Build lines for fzf
+    fzf_lines = []
+    for r in results:
+        seeds = int(r.get("Seeders") or 0)
+        peers = int(r.get("Peers") or 0)
+        size_str = format_size(r.get("Size", 0))
+        tracker = r.get("Tracker", "Unknown")[:12]
+        title = r.get("Title", "Sin título").replace("\t", " ")
+        badge = r.get("_badge", "📦 General")
+        
+        # Color formatting
+        if seeds >= 50:
+            seeds_fmt = f"\x1b[1;32m🌱 {seeds:>4}\x1b[0m"
+        elif seeds >= 15:
+            seeds_fmt = f"\x1b[32m🌱 {seeds:>4}\x1b[0m"
+        elif seeds >= 1:
+            seeds_fmt = f"\x1b[33m🌱 {seeds:>4}\x1b[0m"
+        else:
+            seeds_fmt = f"\x1b[31m🌱 {seeds:>4}\x1b[0m"
+
+        peers_fmt = f"\x1b[33m👥 {peers:>3}\x1b[0m"
+        size_fmt = f"\x1b[36m📦 {size_str:>9}\x1b[0m"
+        badge_fmt = f"\x1b[1;34m{badge:<12}\x1b[0m"
+        track_fmt = f"\x1b[35m[{tracker:<12}]\x1b[0m"
+        
+        line_display = f"{seeds_fmt}  {peers_fmt}  {size_fmt}  {badge_fmt}  {track_fmt}  \x1b[1m{title}\x1b[0m"
+        json_payload = json.dumps(r)
+        fzf_lines.append(f"{line_display}\t{json_payload}")
+
+    header_text = "ENTER: Descargar en qBittorrent | CTRL+Y: Copiar Magnet | Escribe para filtrar (!palabra para excluir) | ESC: Salir"
+    fzf_cmd = [
+        "fzf",
+        "--ansi",
+        "--delimiter=\t",
+        "--with-nth=1",
+        f"--header={header_text}",
+        "--preview=qjackett __preview__ {}",
+        "--preview-window=right:46%:wrap",
+        "--bind=ctrl-y:execute-silent(qjackett __copy_magnet__ {})+abort"
+    ]
+
+    p = subprocess.Popen(fzf_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    out, _ = p.communicate(input="\n".join(fzf_lines))
+
+    if not out or "\t" not in out:
+        return
+
+    selected_json = out.strip().split("\t")[1]
+    selected_data = json.loads(selected_json)
+
+    title = selected_data.get("Title", "Torrent")
+    size_str = format_size(selected_data.get("Size", 0))
+    download_url = selected_data.get("MagnetUri") or selected_data.get("Link")
+
+    if not download_url:
+        print("\x1b[1;31mError: El torrent seleccionado no tiene enlace válido.\x1b[0m")
+        return
+
+    # Add to qBittorrent
+    print(f"\n\x1b[1;34mInyectando a qBittorrent:\x1b[0m \x1b[1m{title}\x1b[0m ({size_str})...")
+    ok = add_to_qbittorrent(download_url)
+    if ok:
+        print(f"\x1b[1;32m✔ ¡Éxito! Torrent añadido correctamente a qBittorrent.\x1b[0m")
+        os.system(f"echo -n '{download_url}' | wl-copy 2>/dev/null")
+        os.system(f"notify-send -a 'qBittorrent' 'Torrent Añadido' '{title}\\n{size_str}' -i qbittorrent 2>/dev/null")
+    else:
+        print(f"\x1b[1;31mFallo al añadir a qBittorrent. Comprueba que qBittorrent está abierto.\x1b[0m")
+        os.system(f"echo -n '{download_url}' | wl-copy 2>/dev/null")
+        print("\x1b[1;33mEl enlace Magnet ha sido copiado a tu portapapeles de todas formas.\x1b[0m")
+
+if __name__ == "__main__":
+    main()
