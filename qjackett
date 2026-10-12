@@ -1,20 +1,111 @@
 #!/usr/bin/env python3
+"""
+⚡ qJackett: Lightning-fast interactive TUI torrent searcher powered by Jackett and fzf,
+with direct injection into qBittorrent, clipboard sync, notifications, and metadata extraction.
+"""
+
 import os
 import sys
 import json
 import glob
 import time
+import re
 import argparse
+import tempfile
+import atexit
+import shutil
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
+import http.cookiejar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-JACKETT_URL = "http://127.0.0.1:9117"
-QBITTORRENT_URL = "http://127.0.0.1:8080"
-JACKETT_CONFIG = os.path.expanduser("~/.config/Jackett/ServerConfig.json")
+VERSION = "1.2.0"
+DEFAULT_CONFIG_DIR = os.path.expanduser("~/.config/qjackett")
+DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.json")
+DEFAULT_JACKETT_CONFIG = os.path.expanduser("~/.config/Jackett/ServerConfig.json")
+
+TEMP_CACHE_FILES = set()
+
+def cleanup_temp_files():
+    """Remove any temporary JSON cache files created during execution."""
+    for path in list(TEMP_CACHE_FILES):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+atexit.register(cleanup_temp_files)
+
+
+# ==============================================================================
+# Configuration Management
+# ==============================================================================
+
+DEFAULT_CONFIG = {
+    "jackett_url": "http://127.0.0.1:9117",
+    "jackett_api_key": "",
+    "qbittorrent_url": "http://127.0.0.1:8080",
+    "qbittorrent_username": "",
+    "qbittorrent_password": "",
+    "auto_category": True,
+    "auto_tags": True,
+    "default_min_seeds": 0,
+    "default_exclude": ["cam", "ts", "telesync"],
+    "default_sort": "seeds",
+    "max_workers": 16,
+    "request_timeout": 5.0,
+    "enable_notifications": True,
+    "auto_copy_magnet": True,
+    "save_paused": False,
+    "open_browser_cmd": "xdg-open"
+}
+
+def load_config(custom_path=None):
+    """Load configuration from file, falling back to defaults and env vars."""
+    config = dict(DEFAULT_CONFIG)
+    config_file = custom_path or os.environ.get("QJACKETT_CONFIG") or DEFAULT_CONFIG_PATH
+
+    if os.path.isfile(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                user_cfg = json.load(f)
+                config.update(user_cfg)
+        except Exception as e:
+            print(f"\x1b[33mAdvertencia: No se pudo leer {config_file}: {e}\x1b[0m", file=sys.stderr)
+
+    # Environment variables overrides
+    if os.environ.get("JACKETT_URL"):
+        config["jackett_url"] = os.environ["JACKETT_URL"]
+    if os.environ.get("JACKETT_API_KEY"):
+        config["jackett_api_key"] = os.environ["JACKETT_API_KEY"]
+    if os.environ.get("QBITTORRENT_URL"):
+        config["qbittorrent_url"] = os.environ["QBITTORRENT_URL"]
+    if os.environ.get("QBITTORRENT_USER") or os.environ.get("QBITTORRENT_USERNAME"):
+        config["qbittorrent_username"] = os.environ.get("QBITTORRENT_USER") or os.environ.get("QBITTORRENT_USERNAME")
+    if os.environ.get("QBITTORRENT_PASS") or os.environ.get("QBITTORRENT_PASSWORD"):
+        config["qbittorrent_password"] = os.environ.get("QBITTORRENT_PASS") or os.environ.get("QBITTORRENT_PASSWORD")
+
+    return config
+
+def init_config_file(target_path=DEFAULT_CONFIG_PATH):
+    """Initialize a default config file if none exists."""
+    os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+    if os.path.exists(target_path):
+        return False
+    with open(target_path, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_CONFIG, f, indent=4)
+    return True
+
+
+# ==============================================================================
+# Helper Utilities (Clipboard, Notifications, Browser, Size)
+# ==============================================================================
 
 def format_size(bytes_val):
+    """Format bytes into human readable string (e.g. 1.5 GB)."""
     try:
         val = float(bytes_val)
         for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -25,267 +116,869 @@ def format_size(bytes_val):
     except Exception:
         return "N/A"
 
-def get_category_badge(cat_desc, cat_ids):
+def parse_size(size_str):
+    """Parse human readable size string (e.g. 500M, 1.5GB) to integer bytes."""
+    if not size_str:
+        return None
+    s = str(size_str).strip().upper()
+    m = re.match(r'^([\d.]+)\s*([KMGTPE]?I?B?)$', s)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+        unit = m.group(2)
+        multipliers = {
+            '': 1, 'B': 1,
+            'K': 1024, 'KB': 1024, 'KIB': 1024,
+            'M': 1024**2, 'MB': 1024**2, 'MIB': 1024**2,
+            'G': 1024**3, 'GB': 1024**3, 'GIB': 1024**3,
+            'T': 1024**4, 'TB': 1024**4, 'TIB': 1024**4,
+            'P': 1024**5, 'PB': 1024**5, 'PIB': 1024**5,
+        }
+        mult = multipliers.get(unit, 1)
+        return int(val * mult)
+    except Exception:
+        return None
+
+def copy_to_clipboard(text):
+    """Copy text to system clipboard with transparent Wayland and X11 fallbacks."""
+    if not text:
+        return False
+    payload = text.encode("utf-8")
+
+    # 1. Wayland wl-copy
+    try:
+        p = subprocess.run(["wl-copy"], input=payload, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if p.returncode == 0:
+            return True
+    except FileNotFoundError:
+        pass
+
+    # 2. X11 xclip
+    try:
+        p = subprocess.run(["xclip", "-selection", "clipboard"], input=payload, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if p.returncode == 0:
+            return True
+    except FileNotFoundError:
+        pass
+
+    # 3. X11 xsel
+    try:
+        p = subprocess.run(["xsel", "--clipboard", "--input"], input=payload, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if p.returncode == 0:
+            return True
+    except FileNotFoundError:
+        pass
+
+    return False
+
+def send_notification(title, body, icon="qbittorrent"):
+    """Send desktop notification safely without shell injection vulnerabilities."""
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "qjackett", "-i", icon, title, body],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError:
+        pass
+
+def open_url_in_browser(url, browser_cmd="xdg-open"):
+    """Open URL safely in browser."""
+    if not url:
+        return False
+    try:
+        subprocess.run(
+            [browser_cmd, url],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return True
+    except FileNotFoundError:
+        return False
+
+
+# ==============================================================================
+# Metadata Extraction & Categorization
+# ==============================================================================
+
+def extract_tags(title):
+    """Extract quality, codec, source, HDR, and audio tags from title."""
+    t = (title or "").lower()
+    tags = []
+
+    # Resolution
+    if re.search(r'\b(2160p|4k|uhd)\b', t):
+        tags.append('2160p/4K')
+    elif re.search(r'\b(1440p|2k)\b', t):
+        tags.append('1440p')
+    elif re.search(r'\b(1080p|fhd)\b', t):
+        tags.append('1080p')
+    elif re.search(r'\b(720p|hd)\b', t):
+        tags.append('720p')
+    elif re.search(r'\b(576p|480p|sd)\b', t):
+        tags.append('480p')
+
+    # Source
+    if re.search(r'\b(remux)\b', t):
+        tags.append('Remux')
+    elif re.search(r'\b(bluray|bdrip|brrip)\b', t):
+        tags.append('BluRay')
+    elif re.search(r'\b(web-?dl|webrip)\b', t):
+        tags.append('WEB-DL')
+    elif re.search(r'\b(hdtv|pdtv)\b', t):
+        tags.append('HDTV')
+    elif re.search(r'\b(dvdrip|dvd-?r)\b', t):
+        tags.append('DVDRip')
+    elif re.search(r'\b(cam|camrip|hdcam|ts|telesync|hdts)\b', t):
+        tags.append('CAM/TS')
+
+    # Video Codec
+    if re.search(r'\b(av1)\b', t):
+        tags.append('AV1')
+    elif re.search(r'\b(hevc|h\.?265|x265)\b', t):
+        tags.append('x265')
+    elif re.search(r'\b(avc|h\.?264|x264)\b', t):
+        tags.append('x264')
+    elif re.search(r'\b(xvid)\b', t):
+        tags.append('XviD')
+
+    # Dynamic Range
+    if re.search(r'(?:\bdolby\s*vision\b|\bdovi\b|\bdv\b)', t):
+        tags.append('DV')
+    if re.search(r'(?:\bhdr10\+(?!\w)|\bhdr10plus\b)', t):
+        tags.append('HDR10+')
+    elif re.search(r'\b(hdr10|hdr)\b', t):
+        tags.append('HDR')
+
+    # Audio
+    if re.search(r'\b(atmos)\b', t):
+        tags.append('Atmos')
+    if re.search(r'\b(truehd)\b', t):
+        tags.append('TrueHD')
+    elif re.search(r'\b(dts-?hd(\s*ma)?|dts:x)\b', t):
+        tags.append('DTS-HD')
+    elif re.search(r'\b(dts)\b', t):
+        tags.append('DTS')
+    if re.search(r'\b(flac)\b', t):
+        tags.append('FLAC')
+    if re.search(r'\b(eac3|ddp5?\.?1?|dd\+)\b', t):
+        tags.append('DDP')
+    elif re.search(r'\b(ac3|dd5?\.?1?)\b', t):
+        tags.append('AC3')
+
+    # Languages
+    if re.search(r'\b(dual)\b', t):
+        tags.append('Dual')
+    elif re.search(r'\b(multi)\b', t):
+        tags.append('Multi')
+    if re.search(r'\b(castellano|spanish|español)\b', t):
+        tags.append('Castellano')
+    elif re.search(r'\b(latino)\b', t):
+        tags.append('Latino')
+    if re.search(r'\b(vose|subtitulado|subs?)\b', t):
+        tags.append('VOSE')
+
+    return tags
+
+def get_category_badge(cat_desc, cat_ids, title=""):
+    """Classify release into category badge and normalized category key."""
     desc = (cat_desc or "").lower()
+    t = (title or "").lower()
     ids = cat_ids or []
-    if "movie" in desc or any(2000 <= c < 3000 for c in ids):
+
+    # Anime (Torznab 5070 or keywords)
+    if any(c in (5070,) for c in ids) or "anime" in desc or "anime" in t:
+        return "🎌 Anime", "anime"
+    # Movies (Torznab 2000-2999)
+    if "movie" in desc or "pelicula" in desc or any(2000 <= c < 3000 for c in ids):
         return "🎬 Película", "movies"
+    # TV Shows / Series (Torznab 5000-5999)
     if "tv" in desc or "serie" in desc or any(5000 <= c < 6000 for c in ids):
         return "📺 Serie", "tv"
+    # Games (Torznab 1000-1999, 4050)
     if "game" in desc or "juego" in desc or any(1000 <= c < 2000 or c == 4050 for c in ids):
         return "🎮 Juego", "games"
+    # Music / Audio (Torznab 3000-3999)
     if "audio" in desc or "music" in desc or "lossless" in desc or any(3000 <= c < 4000 for c in ids):
         return "🎵 Música", "music"
-    if "book" in desc or "libro" in desc or any(7000 <= c < 8000 for c in ids):
+    # Books / Ebooks (Torznab 7000-7999)
+    if "book" in desc or "libro" in desc or "comic" in desc or any(7000 <= c < 8000 for c in ids):
         return "📚 Libro", "books"
-    if "xxx" in desc or any(6000 <= c < 7000 for c in ids):
+    # Adult / XXX (Torznab 6000-6999)
+    if "xxx" in desc or "adult" in desc or any(6000 <= c < 7000 for c in ids):
         return "🔞 Adulto", "xxx"
+    # Software / PC (Torznab 4000-4999)
+    if "pc" in desc or "app" in desc or "soft" in desc or any(4000 <= c < 5000 for c in ids):
+        return "💻 Software", "apps"
+
     return "📦 General", "other"
 
-# Subcommand: Preview handler for fzf
-if len(sys.argv) >= 2 and sys.argv[1] == "__preview__":
-    raw = " ".join(sys.argv[2:])
-    if "\t" in raw:
-        payload = raw.split("\t")[1]
+def render_health_bar(seeds, peers, width=20):
+    """Render a visual ASCII/block health bar for swarm activity."""
+    total = seeds + peers
+    if total == 0:
+        return "\x1b[31m[░░░░░░░░░░░░░░░░░░░░] 0% (Sin actividad)\x1b[0m"
+    ratio = seeds / total
+    filled = int(round(ratio * width))
+    bar = "█" * filled + "░" * (width - filled)
+    pct = int(ratio * 100)
+    if seeds >= 50:
+        color = "\x1b[1;32m"
+        desc = "Excelente"
+    elif seeds >= 15:
+        color = "\x1b[32m"
+        desc = "Buena"
+    elif seeds >= 1:
+        color = "\x1b[33m"
+        desc = "Aceptable"
+    else:
+        color = "\x1b[31m"
+        desc = "Crítica"
+    return f"{color}[{bar}] {pct}% ({desc})\x1b[0m"
+
+
+# ==============================================================================
+# Jackett Client
+# ==============================================================================
+
+def get_jackett_api_key(config):
+    """Retrieve Jackett API key from config or ServerConfig.json."""
+    if config.get("jackett_api_key"):
+        return config["jackett_api_key"]
+
+    if os.path.exists(DEFAULT_JACKETT_CONFIG):
         try:
-            data = json.loads(payload)
-            seeds = int(data.get('Seeders') or 0)
-            peers = int(data.get('Peers') or 0)
-            badge, _ = get_category_badge(data.get('CategoryDesc'), data.get('Category'))
-
-            if seeds >= 50:
-                health = f"\x1b[1;32m🌱 {seeds} semillas (Salud Excelente - Máxima velocidad)\x1b[0m"
-            elif seeds >= 15:
-                health = f"\x1b[32m🌿 {seeds} semillas (Salud Buena)\x1b[0m"
-            elif seeds >= 1:
-                health = f"\x1b[33m⚠️ {seeds} semillas (Pocas semillas)\x1b[0m"
-            else:
-                health = f"\x1b[31m💀 0 semillas (Posiblemente inactivo)\x1b[0m"
-
-            print("\x1b[1;36m========================================================\x1b[0m")
-            print(f"\x1b[1;32mTITULO:\x1b[0m  \x1b[1m{data.get('Title')}\x1b[0m")
-            print("\x1b[1;36m========================================================\x1b[0m")
-            print(f"\x1b[1mCategoría:\x1b[0m  \x1b[1m{badge}\x1b[0m \x1b[90m({data.get('CategoryDesc', 'General')})\x1b[0m")
-            print(f"\x1b[1mTracker:\x1b[0m    \x1b[35m{data.get('Tracker')}\x1b[0m")
-            print(f"\x1b[1mEnjambre:\x1b[0m   {health} | \x1b[33m👥 {peers} sanguijuelas\x1b[0m")
-            print(f"\x1b[1mTamaño:\x1b[0m     \x1b[36m📦 {format_size(data.get('Size', 0))}\x1b[0m")
-            print(f"\x1b[1mPublicado:\x1b[0m  {data.get('PublishDate', 'N/A')[:19]}")
-            print(f"\x1b[1mArchivos:\x1b[0m   {data.get('Files', 'N/A')}")
-            
-            link = data.get("MagnetUri") or data.get("Link") or ""
-            if link.startswith("magnet:"):
-                # Extract infohash if possible
-                import re
-                ih_match = re.search(r'urn:btih:([a-zA-Z0-9]+)', link)
-                if ih_match:
-                    print(f"\x1b[1mInfoHash:\x1b[0m  \x1b[90m{ih_match.group(1)}\x1b[0m")
-
-            print("\n\x1b[1;34mAtajos disponibles:\x1b[0m")
-            print("  \x1b[1m[ENTER]\x1b[0m   -> Enviar directo a qBittorrent")
-            print("  \x1b[1m[CTRL+Y]\x1b[0m  -> Copiar enlace Magnet al portapapeles")
-            print("  \x1b[1m[ESC]\x1b[0m     -> Salir")
-            print("\x1b[90mTip: Puedes escribir !cam o !telesync para excluir palabras.\x1b[0m")
-        except Exception as e:
-            print("Error cargando detalles:", e)
-    sys.exit(0)
-
-# Subcommand: Copy magnet handler for fzf
-if len(sys.argv) >= 2 and sys.argv[1] == "__copy_magnet__":
-    raw = " ".join(sys.argv[2:])
-    if "\t" in raw:
-        payload = raw.split("\t")[1]
-        try:
-            data = json.loads(payload)
-            link = data.get("MagnetUri") or data.get("Link")
-            if link:
-                subprocess.run(["wl-copy", link], check=False)
+            with open(DEFAULT_JACKETT_CONFIG, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("APIKey", "")
         except Exception:
             pass
-    sys.exit(0)
 
-def get_jackett_api_key():
-    if not os.path.exists(JACKETT_CONFIG):
-        print(f"\x1b[1;31mError: No se encontró la configuración de Jackett en {JACKETT_CONFIG}\x1b[0m")
-        sys.exit(1)
-    with open(JACKETT_CONFIG, "r", encoding="utf-8") as f:
-        return json.load(f).get("APIKey", "")
+    return ""
 
-def get_configured_indexers():
+def get_configured_indexers(filter_indexers=None):
+    """Find all configured indexers in Jackett directory."""
     indexers_dir = os.path.expanduser("~/.config/Jackett/Indexers")
+    if not os.path.isdir(indexers_dir):
+        return []
     files = glob.glob(os.path.join(indexers_dir, "*.json"))
-    return [os.path.splitext(os.path.basename(f))[0] for f in files if not f.endswith(".bak")]
+    all_indexers = [os.path.splitext(os.path.basename(f))[0] for f in files if not f.endswith(".bak")]
 
-def search_indexer(indexer, query, api_key):
+    if filter_indexers:
+        patterns = [p.strip().lower() for p in filter_indexers if p.strip()]
+        matched = []
+        for idx in all_indexers:
+            idx_lower = idx.lower()
+            if any(p == idx_lower or p in idx_lower for p in patterns):
+                matched.append(idx)
+        return matched
+
+    return all_indexers
+
+def search_indexer(indexer, query, api_key, jackett_url, timeout=5.0):
+    """Query a single Jackett indexer concurrently."""
     encoded_query = urllib.parse.quote(query)
-    url = f"{JACKETT_URL}/api/v2.0/indexers/{indexer}/results?apikey={api_key}&Query={encoded_query}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    base_url = jackett_url.rstrip("/")
+    url = f"{base_url}/api/v2.0/indexers/{indexer}/results?apikey={api_key}&Query={encoded_query}"
+    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.2 (TUI; Linux)"})
     try:
-        with urllib.request.urlopen(req, timeout=4.5) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
             return data.get("Results", [])
     except Exception:
         return []
 
-def add_to_qbittorrent(download_url):
-    add_url = f"{QBITTORRENT_URL}/api/v2/torrents/add"
-    post_data = urllib.parse.urlencode({"urls": download_url}).encode("utf-8")
-    req = urllib.request.Request(add_url, data=post_data, headers={"User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"\x1b[1;31mError al conectar con qBittorrent: {e}\x1b[0m")
-        return False
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="qJackett: Buscador interactivo TUI de torrents conectado a Jackett y qBittorrent",
-        usage="%(prog)s [opciones] [termino_de_busqueda]"
-    )
-    parser.add_argument("query", nargs="*", help="Término o título a buscar")
-    parser.add_argument("-c", "--category", choices=["movies", "tv", "games", "music", "books", "xxx"], help="Filtrar por categoría")
-    parser.add_argument("-s", "--min-seeds", type=int, default=0, help="Mínimo de semillas (seeders)")
-    parser.add_argument("-x", "--exclude", help="Palabras a excluir separadas por comas (ej. cam,ts,latino)")
+# ==============================================================================
+# qBittorrent Client (WebUI API v2)
+# ==============================================================================
 
-    args = parser.parse_args()
+class QBittorrentClient:
+    """Manages connection and torrent injection into qBittorrent WebUI."""
 
-    api_key = get_jackett_api_key()
-    indexers = get_configured_indexers()
+    def __init__(self, base_url="http://127.0.0.1:8080", username="", password=""):
+        self.base_url = base_url.rstrip("/")
+        self.username = username or ""
+        self.password = password or ""
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
 
-    query_str = " ".join(args.query).strip() if args.query else ""
-
-    if not query_str:
-        print("\x1b[1;36m=======================================================\x1b[0m")
-        print("\x1b[1;32m      ⚡ QJACKETT TUI: BUSCADOR TURBO DE TORRENTS     \x1b[0m")
-        print("\x1b[1;36m=======================================================\x1b[0m")
+    def login(self):
+        """Authenticate with qBittorrent WebUI."""
+        if not self.username:
+            return True
+        login_url = f"{self.base_url}/api/v2/auth/login"
+        post_data = urllib.parse.urlencode({
+            "username": self.username,
+            "password": self.password
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            login_url,
+            data=post_data,
+            headers={"User-Agent": "qjackett/1.2", "Referer": self.base_url}
+        )
         try:
-            query_str = input("\x1b[1m🔍 Introduce qué quieres buscar:\x1b[0m ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nCancelado.")
+            with self.opener.open(req, timeout=5) as resp:
+                text = resp.read().decode("utf-8", errors="ignore")
+                return text.strip() == "Ok." or resp.status == 200
+        except Exception:
+            return False
+
+    def add_torrent(self, urls, category=None, tags=None, paused=False, auto_tmm=True):
+        """Inject torrent magnet link or URL into qBittorrent."""
+        add_url = f"{self.base_url}/api/v2/torrents/add"
+        if isinstance(urls, list):
+            urls_str = "\n".join(urls)
+        else:
+            urls_str = str(urls)
+
+        payload = {
+            "urls": urls_str,
+            "paused": "true" if paused else "false",
+            "autoTMM": "true" if auto_tmm else "false"
+        }
+        if category:
+            payload["category"] = category
+        if tags:
+            if isinstance(tags, (list, set, tuple)):
+                payload["tags"] = ", ".join(tags)
+            else:
+                payload["tags"] = str(tags)
+
+        post_data = urllib.parse.urlencode(payload).encode("utf-8")
+        req = urllib.request.Request(
+            add_url,
+            data=post_data,
+            headers={"User-Agent": "qjackett/1.2", "Referer": self.base_url}
+        )
+
+        try:
+            with self.opener.open(req, timeout=6) as resp:
+                return resp.status == 200
+        except urllib.error.HTTPError as e:
+            status_code = e.code
+            try:
+                e.close()
+            except Exception:
+                pass
+            if status_code == 403 and self.username:
+                if self.login():
+                    try:
+                        with self.opener.open(req, timeout=6) as resp2:
+                            return resp2.status == 200
+                    except Exception:
+                        return False
+            return False
+        except Exception:
+            return False
+
+
+# ==============================================================================
+# Subcommand Handlers for fzf
+# ==============================================================================
+
+def handle_preview(idx_str, cache_file):
+    """Render rich preview panel for fzf."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if idx < 0 or idx >= len(data):
+            print("Elemento no encontrado.")
             return
+        r = data[idx]
 
-    if not query_str:
-        print("Búsqueda vacía. Saliendo.")
-        return
+        title = r.get("Title", "Sin título")
+        seeds = int(r.get("Seeders") or 0)
+        peers = int(r.get("Peers") or 0)
+        badge = r.get("_badge", "📦 General")
+        cat_desc = r.get("CategoryDesc", "Desconocido")
+        tracker = r.get("Tracker", "Desconocido")
+        size_str = format_size(r.get("Size", 0))
+        pub_date = r.get("PublishDate", "N/A")
+        if pub_date and len(pub_date) > 19:
+            pub_date = pub_date[:19].replace("T", " ")
+        files_cnt = r.get("Files", "N/A")
+        infohash = r.get("InfoHash")
+        link = r.get("MagnetUri") or r.get("Link") or ""
+        if not infohash and link.startswith("magnet:"):
+            m = re.search(r'urn:btih:([a-zA-Z0-9]+)', link)
+            if m:
+                infohash = m.group(1)
 
-    # Exclusion list
-    exclude_terms = [t.strip().lower() for t in args.exclude.split(",")] if args.exclude else []
+        details_url = r.get("Details") or r.get("Comments") or ""
+        is_freeleech = r.get("DownloadVolumeFactor", 1) == 0
+        tags = r.get("_tags", [])
 
-    print(f"\x1b[90mConsultando {len(indexers)} trackers en paralelo...\x1b[0m", end="\r", flush=True)
+        # Swarm health
+        health_bar = render_health_bar(seeds, peers, width=22)
 
-    results = []
-    seen_links = set()
+        border = "━" * 58
+        print(f"\x1b[1;36m┏{border}┓\x1b[0m")
+        print(f"\x1b[1;36m┃\x1b[0m \x1b[1;37m{title[:56]:<56}\x1b[0m \x1b[1;36m┃\x1b[0m")
+        if len(title) > 56:
+            print(f"\x1b[1;36m┃\x1b[0m \x1b[1;37m{title[56:112]:<56}\x1b[0m \x1b[1;36m┃\x1b[0m")
+        print(f"\x1b[1;36m┗{border}┛\x1b[0m")
 
+        print(f" \x1b[1;34m📁 Categoría:\x1b[0m   {badge} \x1b[90m({cat_desc})\x1b[0m")
+        print(f" \x1b[1;35m📡 Tracker:\x1b[0m     \x1b[1;35m{tracker}\x1b[0m")
+        if is_freeleech:
+            print(f" \x1b[1;33m⭐ Freeleech:\x1b[0m   \x1b[1;32mSÍ (Descarga sin coste de ratio)\x1b[0m")
+
+        print(f"\n \x1b[1m📊 Estado del Enjambre:\x1b[0m")
+        print(f"    Semillas: \x1b[1;32m{seeds}\x1b[0m  |  Sanguijuelas: \x1b[1;33m{peers}\x1b[0m")
+        print(f"    Salud: {health_bar}")
+
+        if tags:
+            tag_badges = " ".join([f"\x1b[44;37m {t} \x1b[0m" for t in tags])
+            print(f"\n \x1b[1m🏷️  Metadatos detectados:\x1b[0m\n    {tag_badges}")
+
+        print(f"\n \x1b[1;36m📦 Tamaño:\x1b[0m      {size_str}")
+        print(f" \x1b[1m📅 Publicado:\x1b[0m   {pub_date}")
+        if files_cnt and str(files_cnt) != "0":
+            print(f" \x1b[1m🗂️  Archivos:\x1b[0m    {files_cnt}")
+        if infohash:
+            print(f" \x1b[1m🔑 InfoHash:\x1b[0m    \x1b[90m{infohash}\x1b[0m")
+        if details_url:
+            print(f" \x1b[1m🌐 Web/Ficha:\x1b[0m   \x1b[4;34m{details_url[:60]}\x1b[0m")
+
+        print(f"\n\x1b[90m{'─' * 58}\x1b[0m")
+        print(" \x1b[1;33m⌨️  Atajos interactivos:\x1b[0m")
+        print("  \x1b[1;32m[ENTER]\x1b[0m      Descargar en qBittorrent")
+        print("  \x1b[1;36m[TAB]\x1b[0m        Marcar selección múltiple")
+        print("  \x1b[1;33m[CTRL + P]\x1b[0m   Descargar en estado PAUSADO")
+        print("  \x1b[1;35m[CTRL + Y]\x1b[0m   Copiar enlace Magnet (sin salir)")
+        print("  \x1b[1;35m[CTRL + T]\x1b[0m   Copiar título al portapapeles")
+        print("  \x1b[1;34m[CTRL + O]\x1b[0m   Abrir ficha web en el navegador")
+        print("  \x1b[1;31m[ESC]\x1b[0m        Salir o cancelar")
+        print(f"\x1b[90mTip: Usa !termino para excluir (ej. !latino !cam)\x1b[0m")
+    except Exception as e:
+        print(f"Error cargando previsualización: {e}")
+
+def handle_copy_magnet(idx_str, cache_file):
+    """Copy magnet link of selected item and show desktop notification."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            link = r.get("MagnetUri") or r.get("Link")
+            if link:
+                copy_to_clipboard(link)
+                title = r.get("Title", "Torrent")
+                send_notification("qJackett", f"🧲 Magnet copiado al portapapeles:\n{title[:60]}", icon="edit-copy")
+    except Exception:
+        pass
+
+def handle_copy_title(idx_str, cache_file):
+    """Copy title of selected item and show desktop notification."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            title = r.get("Title", "")
+            if title:
+                copy_to_clipboard(title)
+                send_notification("qJackett", f"📋 Título copiado al portapapeles:\n{title[:60]}", icon="edit-copy")
+    except Exception:
+        pass
+
+def handle_open_link(idx_str, cache_file):
+    """Open tracker web details in browser."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            url = r.get("Details") or r.get("Comments") or r.get("Link")
+            if url and url.startswith("http"):
+                open_url_in_browser(url)
+                title = r.get("Title", "Torrent")
+                send_notification("qJackett", f"🌐 Abriendo ficha en el navegador:\n{title[:60]}")
+    except Exception:
+        pass
+
+
+# ==============================================================================
+# Search Runner & TUI Engine
+# ==============================================================================
+
+def format_list_line(idx, r):
+    """Format single result row for fzf display."""
+    seeds = int(r.get("Seeders") or 0)
+    peers = int(r.get("Peers") or 0)
+    size_str = format_size(r.get("Size", 0))
+    tracker = (r.get("Tracker") or "Unknown")[:12]
+    title = (r.get("Title") or "Sin título").replace("\t", " ")
+    badge = r.get("_badge", "📦 General")
+    fl = r.get("DownloadVolumeFactor", 1) == 0
+
+    if seeds >= 50:
+        seeds_fmt = f"\x1b[1;32m🌱 {seeds:>4}\x1b[0m"
+    elif seeds >= 15:
+        seeds_fmt = f"\x1b[32m🌱 {seeds:>4}\x1b[0m"
+    elif seeds >= 1:
+        seeds_fmt = f"\x1b[33m🌱 {seeds:>4}\x1b[0m"
+    else:
+        seeds_fmt = f"\x1b[31m🌱 {seeds:>4}\x1b[0m"
+
+    peers_fmt = f"\x1b[33m👥 {peers:>3}\x1b[0m"
+    size_fmt = f"\x1b[36m📦 {size_str:>8}\x1b[0m"
+    badge_fmt = f"\x1b[1;34m{badge:<12}\x1b[0m"
+    fl_fmt = "\x1b[1;33m⭐FL\x1b[0m " if fl else "    "
+    track_fmt = f"\x1b[35m[{tracker:<12}]\x1b[0m"
+
+    tags = r.get("_tags", [])
+    tags_fmt = ""
+    if tags:
+        top_tags = " ".join([f"\x1b[90m[{t}]\x1b[0m" for t in tags[:3]])
+        tags_fmt = f"{top_tags} "
+
+    display = f"{seeds_fmt}  {peers_fmt}  {size_fmt}  {fl_fmt}{badge_fmt}  {track_fmt}  {tags_fmt}\x1b[1m{title}\x1b[0m"
+    return f"{idx}\t{display}"
+
+def run_query(query_str, config, args, api_key, indexers):
+    """Execute multi-threaded search across indexers, apply filters, and return results."""
+    exclude_terms = list(config.get("default_exclude", []))
+    if args.exclude:
+        exclude_terms.extend([t.strip().lower() for t in args.exclude.split(",") if t.strip()])
+
+    min_bytes = parse_size(args.min_size) if args.min_size else None
+    max_bytes = parse_size(args.max_size) if args.max_size else None
+    min_seeds = args.min_seeds if args.min_seeds is not None else config.get("default_min_seeds", 0)
+
+    print(f"\x1b[90mConsultando {len(indexers)} indexers en paralelo...\x1b[0m", end="\r", flush=True)
+
+    results_by_key = {}
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        futures = {executor.submit(search_indexer, idx, query_str, api_key): idx for idx in indexers}
+    max_workers = config.get("max_workers", 16)
+    timeout = config.get("request_timeout", 5.0)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(search_indexer, idx, query_str, api_key, config["jackett_url"], timeout): idx
+            for idx in indexers
+        }
         for future in as_completed(futures):
             res_list = future.result()
             for r in res_list:
                 link = r.get("MagnetUri") or r.get("Link")
-                if not link or link in seen_links:
+                if not link:
                     continue
 
                 seeds = int(r.get("Seeders") or 0)
-                if seeds < args.min_seeds:
+                if seeds < min_seeds:
+                    continue
+
+                # Size filters
+                r_size = int(r.get("Size") or 0)
+                if min_bytes is not None and r_size < min_bytes:
+                    continue
+                if max_bytes is not None and r_size > max_bytes:
                     continue
 
                 title = r.get("Title", "")
                 lower_title = title.lower()
 
-                # Exclude terms filter
+                # Exclude filter
                 if any(ex in lower_title for ex in exclude_terms):
                     continue
 
-                badge, cat_key = get_category_badge(r.get("CategoryDesc"), r.get("Category"))
+                badge, cat_key = get_category_badge(r.get("CategoryDesc"), r.get("Category"), title)
                 if args.category and cat_key != args.category:
                     continue
 
-                seen_links.add(link)
+                tags = extract_tags(title)
                 r["_badge"] = badge
                 r["_cat_key"] = cat_key
-                results.append(r)
+                r["_tags"] = tags
+
+                # Deduplication by InfoHash or Link, keeping best seeder count
+                infohash = (r.get("InfoHash") or "").lower()
+                dedup_key = infohash if infohash else link
+
+                if dedup_key in results_by_key:
+                    existing = results_by_key[dedup_key]
+                    if int(r.get("Seeders") or 0) > int(existing.get("Seeders") or 0):
+                        results_by_key[dedup_key] = r
+                else:
+                    results_by_key[dedup_key] = r
 
     elapsed = time.time() - t0
+    results = list(results_by_key.values())
 
     if not results:
         print(f"\x1b[1;33mNo se encontraron torrents para '{query_str}' ({elapsed:.1f}s).\x1b[0m")
+        return []
+
+    # Sort results
+    sort_mode = args.sort or config.get("default_sort", "seeds")
+    reverse_sort = not args.reverse
+    if sort_mode == "seeds":
+        results.sort(key=lambda x: int(x.get("Seeders") or 0), reverse=reverse_sort)
+    elif sort_mode == "peers":
+        results.sort(key=lambda x: int(x.get("Peers") or 0), reverse=reverse_sort)
+    elif sort_mode == "size":
+        results.sort(key=lambda x: int(x.get("Size") or 0), reverse=reverse_sort)
+    elif sort_mode == "date":
+        results.sort(key=lambda x: str(x.get("PublishDate") or ""), reverse=reverse_sort)
+
+    print(f"\x1b[1;32mEncontrados {len(results)} torrents en {elapsed:.2f}s.\x1b[0m Abriendo TUI...")
+    return results
+
+def run_fzf_tui(results, config, args, qb_client):
+    """Launch fzf interactive browser and handle selection actions."""
+    if not results:
         return
 
-    # Sort results by Seeders descending
-    results.sort(key=lambda x: int(x.get("Seeders") or 0), reverse=True)
+    # Check fzf binary
+    if not shutil.which("fzf"):
+        print("\x1b[1;31mError: 'fzf' no está instalado o no se encuentra en el PATH.\x1b[0m")
+        print("Instálalo con: sudo pacman -S fzf")
+        sys.exit(1)
 
-    print(f"\x1b[1;32mEncontrados {len(results)} resultados en {elapsed:.2f}s.\x1b[0m Abriendo TUI...")
+    # Dump results to temporary cache file
+    cache_fd, cache_path = tempfile.mkstemp(prefix="qjackett_cache_", suffix=".json")
+    TEMP_CACHE_FILES.add(cache_path)
+    with os.fdopen(cache_fd, "w", encoding="utf-8") as f:
+        json.dump(results, f)
 
-    # Build lines for fzf
-    fzf_lines = []
-    for r in results:
-        seeds = int(r.get("Seeders") or 0)
-        peers = int(r.get("Peers") or 0)
-        size_str = format_size(r.get("Size", 0))
-        tracker = r.get("Tracker", "Unknown")[:12]
-        title = r.get("Title", "Sin título").replace("\t", " ")
-        badge = r.get("_badge", "📦 General")
-        
-        # Color formatting
-        if seeds >= 50:
-            seeds_fmt = f"\x1b[1;32m🌱 {seeds:>4}\x1b[0m"
-        elif seeds >= 15:
-            seeds_fmt = f"\x1b[32m🌱 {seeds:>4}\x1b[0m"
-        elif seeds >= 1:
-            seeds_fmt = f"\x1b[33m🌱 {seeds:>4}\x1b[0m"
-        else:
-            seeds_fmt = f"\x1b[31m🌱 {seeds:>4}\x1b[0m"
+    fzf_lines = [format_list_line(i, r) for i, r in enumerate(results)]
 
-        peers_fmt = f"\x1b[33m👥 {peers:>3}\x1b[0m"
-        size_fmt = f"\x1b[36m📦 {size_str:>9}\x1b[0m"
-        badge_fmt = f"\x1b[1;34m{badge:<12}\x1b[0m"
-        track_fmt = f"\x1b[35m[{tracker:<12}]\x1b[0m"
-        
-        line_display = f"{seeds_fmt}  {peers_fmt}  {size_fmt}  {badge_fmt}  {track_fmt}  \x1b[1m{title}\x1b[0m"
-        json_payload = json.dumps(r)
-        fzf_lines.append(f"{line_display}\t{json_payload}")
+    # Resolve python interpreter and script path for subcommands
+    py_exec = sys.executable
+    script_path = os.path.abspath(sys.argv[0])
 
-    header_text = "ENTER: Descargar en qBittorrent | CTRL+Y: Copiar Magnet | Escribe para filtrar (!palabra para excluir) | ESC: Salir"
+    header_text = "ENTER: Descargar | TAB: Marcar varios | CTRL+P: Descargar en PAUSA | CTRL+Y: Copiar Magnet | CTRL+T: Copiar Título | CTRL+O: Web | ESC: Salir"
     fzf_cmd = [
         "fzf",
         "--ansi",
+        "--multi",
+        "--expect=ctrl-p",
         "--delimiter=\t",
-        "--with-nth=1",
+        "--with-nth=2..",
         f"--header={header_text}",
-        "--preview=qjackett __preview__ {}",
-        "--preview-window=right:46%:wrap",
-        "--bind=ctrl-y:execute-silent(qjackett __copy_magnet__ {})+abort"
+        f"--preview={py_exec} {script_path} __preview__ {{1}} {cache_path}",
+        "--preview-window=right:48%:wrap",
+        f"--bind=ctrl-y:execute-silent({py_exec} {script_path} __copy_magnet__ {{1}} {cache_path})",
+        f"--bind=ctrl-t:execute-silent({py_exec} {script_path} __copy_title__ {{1}} {cache_path})",
+        f"--bind=ctrl-o:execute-silent({py_exec} {script_path} __open_link__ {{1}} {cache_path})"
     ]
 
     p = subprocess.Popen(fzf_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     out, _ = p.communicate(input="\n".join(fzf_lines))
 
-    if not out or "\t" not in out:
+    if not out:
         return
 
-    selected_json = out.strip().split("\t")[1]
-    selected_data = json.loads(selected_json)
-
-    title = selected_data.get("Title", "Torrent")
-    size_str = format_size(selected_data.get("Size", 0))
-    download_url = selected_data.get("MagnetUri") or selected_data.get("Link")
-
-    if not download_url:
-        print("\x1b[1;31mError: El torrent seleccionado no tiene enlace válido.\x1b[0m")
+    raw_lines = out.split("\n")
+    if not raw_lines:
         return
 
-    # Add to qBittorrent
-    print(f"\n\x1b[1;34mInyectando a qBittorrent:\x1b[0m \x1b[1m{title}\x1b[0m ({size_str})...")
-    ok = add_to_qbittorrent(download_url)
-    if ok:
-        print(f"\x1b[1;32m✔ ¡Éxito! Torrent añadido correctamente a qBittorrent.\x1b[0m")
-        os.system(f"echo -n '{download_url}' | wl-copy 2>/dev/null")
-        os.system(f"notify-send -a 'qBittorrent' 'Torrent Añadido' '{title}\\n{size_str}' -i qbittorrent 2>/dev/null")
+    key_pressed = raw_lines[0].strip()
+    selected_lines = [l for l in raw_lines[1:] if l.strip()]
+
+    # Fallback if first line was an item rather than an expect key
+    if "\t" in key_pressed:
+        key_pressed = ""
+        selected_lines = [l for l in raw_lines if l.strip()]
+
+    if not selected_lines:
+        return
+
+    is_paused = (key_pressed == "ctrl-p") or args.paused or config.get("save_paused", False)
+
+    # Collect selected items
+    selected_items = []
+    for line in selected_lines:
+        try:
+            idx = int(line.split("\t")[0])
+            if 0 <= idx < len(results):
+                selected_items.append(results[idx])
+        except Exception:
+            continue
+
+    if not selected_items:
+        return
+
+    # Injection into qBittorrent
+    status_label = " (PAUSADO)" if is_paused else ""
+    print(f"\n\x1b[1;34mInyectando {len(selected_items)} torrent(s) a qBittorrent{status_label}...\x1b[0m")
+
+    success_count = 0
+    failed_count = 0
+    added_magnets = []
+
+    for item in selected_items:
+        link = item.get("MagnetUri") or item.get("Link")
+        if not link:
+            continue
+        title = item.get("Title", "Torrent")
+        size_str = format_size(item.get("Size", 0))
+
+        cat_key = item.get("_cat_key")
+        category = cat_key if config.get("auto_category", True) and cat_key != "other" else None
+
+        tags = []
+        if config.get("auto_tags", True):
+            tags.append("qjackett")
+            tags.extend(item.get("_tags", []))
+
+        ok = qb_client.add_torrent(link, category=category, tags=tags, paused=is_paused)
+        if ok:
+            success_count += 1
+            added_magnets.append(link)
+            print(f"  \x1b[1;32m✔\x1b[0m {title[:65]} ({size_str})")
+        else:
+            failed_count += 1
+            print(f"  \x1b[1;31m✘\x1b[0m {title[:65]} (Fallo al conectar)")
+
+    # Clipboard sync
+    if added_magnets and config.get("auto_copy_magnet", True):
+        copy_to_clipboard("\n".join(added_magnets))
+
+    # Notifications
+    if config.get("enable_notifications", True):
+        if len(selected_items) == 1 and success_count == 1:
+            it = selected_items[0]
+            action_desc = "Torrent Añadido (Pausado)" if is_paused else "Torrent Añadido"
+            send_notification(action_desc, f"{it.get('Title')}\n{format_size(it.get('Size', 0))}", icon="qbittorrent")
+        elif success_count > 0:
+            action_desc = f"{success_count} Torrents Añadidos{' (Pausados)' if is_paused else ''}"
+            send_notification(action_desc, f"Se añadieron {success_count} torrents a qBittorrent", icon="qbittorrent")
+
+    if success_count > 0 and failed_count == 0:
+        print(f"\x1b[1;32m✔ ¡Éxito! Todos los torrents se añadieron correctamente.\x1b[0m")
+    elif success_count > 0 and failed_count > 0:
+        print(f"\x1b[1;33mSe añadieron {success_count} torrents, pero {failed_count} fallaron.\x1b[0m")
     else:
-        print(f"\x1b[1;31mFallo al añadir a qBittorrent. Comprueba que qBittorrent está abierto.\x1b[0m")
-        os.system(f"echo -n '{download_url}' | wl-copy 2>/dev/null")
-        print("\x1b[1;33mEl enlace Magnet ha sido copiado a tu portapapeles de todas formas.\x1b[0m")
+        print(f"\x1b[1;31mFallo al añadir a qBittorrent. Comprueba que el WebUI esté activo.\x1b[0m")
+        if added_magnets:
+            print("\x1b[1;33mLos enlaces Magnet han sido copiados a tu portapapeles de todas formas.\x1b[0m")
+
+
+# ==============================================================================
+# Main Entry Point
+# ==============================================================================
+
+def main():
+    # Handle subcommands called by fzf directly
+    if len(sys.argv) >= 4:
+        subcmd = sys.argv[1]
+        idx_arg = sys.argv[2]
+        cache_arg = sys.argv[3]
+        if subcmd == "__preview__":
+            handle_preview(idx_arg, cache_arg)
+            sys.exit(0)
+        elif subcmd == "__copy_magnet__":
+            handle_copy_magnet(idx_arg, cache_arg)
+            sys.exit(0)
+        elif subcmd == "__copy_title__":
+            handle_copy_title(idx_arg, cache_arg)
+            sys.exit(0)
+        elif subcmd == "__open_link__":
+            handle_open_link(idx_arg, cache_arg)
+            sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        prog="qjackett",
+        description="qJackett: Buscador interactivo TUI de torrents supercargado (Jackett + fzf + qBittorrent)",
+        usage="%(prog)s [opciones] [termino_de_busqueda]"
+    )
+    parser.add_argument("query", nargs="*", help="Término o título a buscar")
+    parser.add_argument("-c", "--category",
+                        choices=["movies", "tv", "anime", "games", "music", "books", "apps", "xxx"],
+                        help="Filtrar por categoría")
+    parser.add_argument("-s", "--min-seeds", type=int, default=None, help="Mínimo de semillas (seeders)")
+    parser.add_argument("-x", "--exclude", help="Palabras a excluir separadas por comas (ej. cam,ts,latino)")
+    parser.add_argument("--min-size", help="Tamaño mínimo (ej. 500M, 1.5G, 10GB)")
+    parser.add_argument("--max-size", help="Tamaño máximo (ej. 4GB, 25GB)")
+    parser.add_argument("-i", "--indexer", help="Filtrar indexers específicos por nombre (ej. therarbg,yts)")
+    parser.add_argument("--sort", choices=["seeds", "peers", "size", "date"], default=None,
+                        help="Criterio de ordenación (default: seeds)")
+    parser.add_argument("-r", "--reverse", action="store_true", help="Invertir el orden de clasificación")
+    parser.add_argument("-p", "--paused", action="store_true", help="Inyectar torrents en estado pausado")
+    parser.add_argument("-l", "--loop", action="store_true", help="Modo interactivo continuo (bucle de búsqueda)")
+    parser.add_argument("--config", help="Ruta personalizada a archivo de configuración JSON")
+    parser.add_argument("--init-config", action="store_true", help="Crear archivo de configuración inicial")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s v{VERSION}")
+
+    args = parser.parse_args()
+
+    # Handle --init-config
+    if args.init_config:
+        target = args.config or DEFAULT_CONFIG_PATH
+        if init_config_file(target):
+            print(f"\x1b[1;32m✔ Archivo de configuración creado con éxito en:\x1b[0m\n  {target}")
+        else:
+            print(f"\x1b[1;33mEl archivo de configuración ya existe en:\x1b[0m\n  {target}")
+        sys.exit(0)
+
+    # Load configuration
+    config = load_config(args.config)
+
+    # Check Jackett API key
+    api_key = get_jackett_api_key(config)
+    if not api_key:
+        print(f"\x1b[1;31mError: No se encontró la API Key de Jackett.\x1b[0m")
+        print("Configúrala en ~/.config/qjackett/config.json o inicia Jackett una vez.")
+        sys.exit(1)
+
+    # Check configured indexers
+    filter_list = args.indexer.split(",") if args.indexer else None
+    indexers = get_configured_indexers(filter_list)
+    if not indexers:
+        print("\x1b[1;31mError: No se encontraron indexers configurados en Jackett.\x1b[0m")
+        if filter_list:
+            print(f"Comprueba los filtros de indexer especificados: {args.indexer}")
+        sys.exit(1)
+
+    # Initialize qBittorrent client
+    qb_client = QBittorrentClient(
+        base_url=config.get("qbittorrent_url", "http://127.0.0.1:8080"),
+        username=config.get("qbittorrent_username", ""),
+        password=config.get("qbittorrent_password", "")
+    )
+
+    query_str = " ".join(args.query).strip() if args.query else ""
+    interactive_mode = not bool(query_str)
+
+    while True:
+        if not query_str:
+            print("\x1b[1;36m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\x1b[0m")
+            print(f"\x1b[1;36m┃\x1b[0m \x1b[1;32m      ⚡ QJACKETT v{VERSION} — BUSCADOR TURBO DE TORRENTS     \x1b[0m \x1b[1;36m┃\x1b[0m")
+            print("\x1b[1;36m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\x1b[0m")
+            try:
+                query_str = input("\x1b[1m🔍 Introduce qué quieres buscar (Enter vacío para salir):\x1b[0m ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nOperación cancelada.")
+                break
+
+        if not query_str:
+            print("Saliendo de qJackett.")
+            break
+
+        results = run_query(query_str, config, args, api_key, indexers)
+        if results:
+            run_fzf_tui(results, config, args, qb_client)
+
+        # Loop control
+        if not (args.loop or interactive_mode):
+            break
+
+        query_str = ""
+        print()
+
 
 if __name__ == "__main__":
     main()
