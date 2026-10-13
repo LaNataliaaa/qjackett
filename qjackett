@@ -348,7 +348,7 @@ def get_tmdb_metadata(title, cat_key="movies", api_key=TMDB_API_KEY):
             if results:
                 top = results[0]
                 poster_path = top.get("poster_path")
-                poster_url = f"https://image.tmdb.org/t/p/w300{poster_path}" if poster_path else None
+                poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
                 return {
                     "id": top.get("id"),
                     "title": top.get("title") or top.get("name") or clean_name,
@@ -364,9 +364,9 @@ def get_tmdb_metadata(title, cat_key="movies", api_key=TMDB_API_KEY):
     return None
 
 def render_poster_terminal(poster_url, title_id):
-    """Download poster to cache and render graphic thumbnail using chafa."""
+    """Download poster to cache and render high-resolution graphic thumbnail in terminal."""
     if not poster_url or not shutil.which("chafa"):
-        return ""
+        return False
     try:
         os.makedirs(DEFAULT_POSTERS_DIR, exist_ok=True)
         filename = f"{title_id}.jpg"
@@ -377,15 +377,36 @@ def render_poster_terminal(poster_url, title_id):
             with urllib.request.urlopen(req, timeout=3) as resp, open(cached_path, "wb") as f:
                 f.write(resp.read())
 
-        p = subprocess.run(
-            ["chafa", "--format=symbols", "-s", "24x12", cached_path],
-            capture_output=True, text=True, check=False
-        )
+        # Determine dimensions matching fzf preview panel
+        cols_env = os.environ.get("FZF_PREVIEW_COLUMNS")
+        lines_env = os.environ.get("FZF_PREVIEW_LINES")
+
+        preview_cols = int(cols_env) if cols_env and cols_env.isdigit() else 50
+        preview_lines = int(lines_env) if lines_env and lines_env.isdigit() else 35
+
+        w = max(26, min(38, preview_cols - 4))
+        h = max(16, min(24, int(w * 0.65), preview_lines // 2))
+
+        # Detect terminal protocol (Kitty graphics, Sixel, or high-res symbols)
+        is_kitty = bool(os.environ.get("KITTY_PID") or os.environ.get("TERM") == "xterm-kitty" or os.environ.get("TERM_PROGRAM") == "kitty")
+        is_foot = bool(os.environ.get("FOOT_SERVER_SOCKET") or "foot" in os.environ.get("TERM", ""))
+
+        if is_kitty:
+            cmd = ["chafa", "-f", "kitty", "-s", f"{w}x{h}", cached_path]
+        elif is_foot:
+            cmd = ["chafa", "-f", "sixels", "-s", f"{w}x{h}", cached_path]
+        else:
+            cmd = ["chafa", "--symbols=vhalf,hhalf,quad,block,braille", "-s", f"{w}x{h}", cached_path]
+
+        p = subprocess.run(cmd, capture_output=True, check=False)
         if p.returncode == 0 and p.stdout:
-            return p.stdout
+            sys.stdout.buffer.write(p.stdout)
+            sys.stdout.buffer.write(b"\n")
+            sys.stdout.flush()
+            return True
     except Exception:
         pass
-    return ""
+    return False
 
 
 # ==============================================================================
@@ -1039,9 +1060,7 @@ def handle_preview(idx_str, cache_file):
         # TMDB Poster & Ficha
         tmdb_info = get_tmdb_metadata(title, cat_key)
         if tmdb_info and tmdb_info.get("poster_url"):
-            poster_art = render_poster_terminal(tmdb_info["poster_url"], tmdb_info["id"])
-            if poster_art:
-                print(poster_art)
+            render_poster_terminal(tmdb_info["poster_url"], tmdb_info["id"])
 
         border = "━" * 58
         print(f"\x1b[1;36m┏{border}┓\x1b[0m")
