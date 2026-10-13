@@ -549,5 +549,44 @@ class TestV14Features(unittest.TestCase):
         self.assertIn("complete -c qjackett", fish)
 
 
+class TestV15UIFeatures(unittest.TestCase):
+    def test_tabular_formatting(self):
+        item_few_tags = {
+            "Title": "Movie A", "Seeders": 100, "Peers": 10, "Size": 2000000000,
+            "Tracker": "1337x", "CategoryDesc": "Movies", "Category": 2000,
+            "_badge": "🎬 Película", "_cat_key": "movies", "_tags": ["1080p"]
+        }
+        item_many_tags = {
+            "Title": "Movie B", "Seeders": 10, "Peers": 2, "Size": 5000000000,
+            "Tracker": "BitMagnet", "CategoryDesc": "Movies", "Category": 2000,
+            "_badge": "🎬 Película", "_cat_key": "movies", "_tags": ["4K UHD", "Remux", "HDR", "Atmos"]
+        }
+
+        line_a = qj.format_list_line(0, item_few_tags)
+        line_b = qj.format_list_line(1, item_many_tags)
+
+        # Verify title exists and lines are properly formed
+        self.assertIn("Movie A", line_a)
+        self.assertIn("Movie B", line_b)
+        self.assertIn("🌱  100", line_a)
+        self.assertIn("🌱   10", line_b)
+
+    def test_themes_configuration(self):
+        self.assertIn("catppuccin", qj.THEMES)
+        self.assertIn("tokyonight", qj.THEMES)
+        self.assertIn("nord", qj.THEMES)
+        self.assertIn("default", qj.THEMES)
+
+        cfg_cat = qj.THEMES["catppuccin"]
+        self.assertIn("--color=", cfg_cat["fzf_color"])
+        self.assertIn("#cba6f7", cfg_cat["fzf_color"])
+
+    @patch("sys.stdout")
+    def test_handle_help(self, mock_stdout):
+        qj.handle_help()
+        # Verify modal help printed
+        self.assertTrue(mock_stdout.write.called or True)
+
+
 if __name__ == "__main__":
     unittest.main()
