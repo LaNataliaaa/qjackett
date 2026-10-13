@@ -1,6 +1,6 @@
 # Maintainer: LaNataliaaa <33694493+LaNataliaaa@users.noreply.github.com>
 pkgname=qjackett-git
-pkgver=1.5.0
+pkgver=1.6.0
 pkgrel=1
 pkgdesc="A lightning-fast interactive TUI torrent searcher powered by Jackett, BitMagnet and fzf with direct qBittorrent injection"
 arch=('any')
@@ -9,6 +9,7 @@ license=('MIT')
 depends=('python' 'fzf' 'libnotify')
 optdepends=(
     'chafa: render graphical movie posters in terminal'
+    'yt-dlp: stream official movie and series trailers in mpv'
     'wl-clipboard: clipboard support on Wayland'
     'xclip: clipboard support on X11'
     'xsel: alternative clipboard support on X11'
@@ -24,7 +25,7 @@ md5sums=('SKIP')
 
 pkgver() {
     cd "${srcdir}/qjackett"
-    printf "1.5.0.r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    printf "1.6.0.r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 package() {
