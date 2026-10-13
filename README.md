@@ -12,6 +12,13 @@
 
 ## ✨ Features
 
+- 🎬 **Official Movie & Series Trailer Player:** Press `Alt + T` over any title to launch the official HD YouTube trailer in a floating `mpv` window before downloading.
+- 🖼️ **Graphic Poster Desktop Notifications:** Desktop notifications in Hyprland/Wayland display the full-color movie poster image directly in the notification popup.
+- 💾 **Smart Disk Space Check:** Automatically queries qBittorrent and warns before injecting if the torrent size exceeds available drive space.
+- 🧲 **Direct InfoHash & Magnet Resolution:** Pass an InfoHash or `magnet:?xt=urn:btih:...` directly to `qjackett` to resolve metadata and files instantly via BitMagnet DHT.
+- 🔥 **Trending & Billboard Browser:** Explore top weekly movies and series (`qjackett --trending` or `F6`) and launch torrent searches with a single click.
+- 🗂️ **Interactive Category Picker:** Press `Ctrl + G` to choose the destination category/directory configured in qBittorrent.
+- 🧹 **Download Cleaner Manager:** Clean up completed or stalled downloads from qBittorrent and disk with `qjackett --clean`.
 - 🎨 **Visual Themes & System Integration:** Support for popular palettes via `--theme` (`catppuccin`, `tokyonight`, `nord`, `default`) harmonized across borders, tags, and `fzf`.
 - 🗂️ **Fixed Tabular Column Alignment:** Titles remain strictly aligned horizontally across all rows regardless of tag lengths or tracker names.
 - 🎴 **Cinema Card Preview:** Modern rounded borders (`╭───╮`, `╰───╯`), star ratings (`★★★★☆`), and vibrant colored pills for resolution, codecs, and audio formats.
