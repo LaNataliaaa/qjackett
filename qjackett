@@ -400,9 +400,14 @@ def render_poster_terminal(poster_url, title_id):
 
         p = subprocess.run(cmd, capture_output=True, check=False)
         if p.returncode == 0 and p.stdout:
-            sys.stdout.buffer.write(p.stdout)
-            sys.stdout.buffer.write(b"\n")
-            sys.stdout.flush()
+            extra_lines = ("\n" * (h + 1)) if (is_kitty or is_foot) else "\n"
+            if hasattr(sys.stdout, "buffer"):
+                sys.stdout.buffer.write(p.stdout)
+                sys.stdout.buffer.write(extra_lines.encode("utf-8"))
+                sys.stdout.flush()
+            else:
+                sys.stdout.write(p.stdout.decode("utf-8", errors="ignore") + extra_lines)
+                sys.stdout.flush()
             return True
     except Exception:
         pass
@@ -1022,6 +1027,15 @@ def handle_preview(idx_str, cache_file):
             print("Elemento no encontrado.")
             return
         r = data[idx]
+
+        # Clear previous graphics in Kitty terminal to prevent lingering overlays
+        if bool(os.environ.get("KITTY_PID") or os.environ.get("TERM") == "xterm-kitty" or os.environ.get("TERM_PROGRAM") == "kitty"):
+            if hasattr(sys.stdout, "buffer"):
+                sys.stdout.buffer.write(b"\x1b_Ga=d,d=A\x1b\\")
+                sys.stdout.flush()
+            else:
+                sys.stdout.write("\x1b_Ga=d,d=A\x1b\\")
+                sys.stdout.flush()
 
         title = r.get("Title", "Sin título")
         seeds = int(r.get("Seeders") or 0)
