@@ -12,7 +12,14 @@
 
 ## ✨ Features
 
-- 🖼️ **TMDB Posters & Spanish Synopses in Terminal:** Automatically fetches official movie/show posters rendered directly inside the preview panel via `chafa`, along with IMDb/TMDB rating and Spanish synopsis.
+- 🎨 **Visual Themes & System Integration:** Support for popular palettes via `--theme` (`catppuccin`, `tokyonight`, `nord`, `default`) harmonized across borders, tags, and `fzf`.
+- 🗂️ **Fixed Tabular Column Alignment:** Titles remain strictly aligned horizontally across all rows regardless of tag lengths or tracker names.
+- 🎴 **Cinema Card Preview:** Modern rounded borders (`╭───╮`, `╰───╯`), star ratings (`★★★★☆`), and vibrant colored pills for resolution, codecs, and audio formats.
+- 🎯 **Dynamic Prompt Indicators:** Live search prompt showing current active category filter and sorting criteria (`🔍 [Películas | Semillas] > `).
+- 🪟 **On-the-Fly Layout Switching:** Press `F9` / `Alt + P` to cycle preview positions (Right $\leftrightarrow$ Bottom $\leftrightarrow$ Hidden) and `F10` to toggle preview.
+- ❓ **Clean Modal Help Sheet:** Uncluttered preview area with a modal cheat sheet accessible anytime by pressing `?` or `F12`.
+- 📊 **Multi-Selection Counter & Total Weight:** Displays real-time total selected torrent count and accumulated download size when queueing into qBittorrent.
+- 🖼️ **TMDB Posters & Spanish Synopses in Terminal:** Automatically fetches official movie/show posters rendered directly inside the preview panel via `chafa` (with native Kitty Graphics Protocol support), along with IMDb/TMDB rating and Spanish synopsis.
 - 🎛️ **Selective Files Downloader:** Press `Ctrl + E` to pick and choose specific episodes or files using an interactive multi-select menu before queueing into qBittorrent.
 - ⚡ **Tracker Booster:** Automatically injects verified high-speed public trackers into magnet links, accelerating DHT peer discovery in seconds.
 - 🍿 **Direct *Arr Suite Integration:** Press `Ctrl + R` to send releases directly to Radarr, Sonarr or Lidarr for automated library management and Jellyfin syncing.
