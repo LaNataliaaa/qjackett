@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-⚡ qJackett v1.5.0: The Ultimate Terminal Torrent Suite
+⚡ qJackett v1.6.0: The Ultimate Terminal Torrent Suite
 Powered by Jackett, BitMagnet (DHT), and fzf, with direct injection into qBittorrent,
 stream prioritization, in-TUI dynamic filtering, malware detection, downloads monitor,
 bookmark management, TMDB graphic posters, selective file downloading, Tracker Booster,
-*Arr integration, tabular layout, cinema card preview, and themes (Catppuccin/TokyoNight/Nord).
+*Arr integration, tabular layout, cinema card preview, themes, official trailer player,
+poster desktop notifications, disk space verification, infohash resolution, trending billboard,
+qBittorrent category picker, and download cleaner.
 """
 
 import os
@@ -29,7 +31,7 @@ try:
 except ImportError:
     readline = None
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 DEFAULT_CONFIG_DIR = os.path.expanduser("~/.config/qjackett")
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.json")
 DEFAULT_BOOKMARKS_PATH = os.path.join(DEFAULT_CONFIG_DIR, "bookmarks.json")
@@ -80,6 +82,7 @@ DEFAULT_CONFIG = {
     "bazarr_api_key": "",
     "tmdb_api_key": TMDB_API_KEY,
     "enable_posters": True,
+    "check_disk_space": True,
     "auto_category": True,
     "auto_tags": True,
     "default_min_seeds": 0,
@@ -94,15 +97,14 @@ DEFAULT_CONFIG = {
     "security_warning": True
 }
 
-# Theme palettes for fzf and preview cards
 THEMES = {
     "catppuccin": {
-        "border": "\x1b[38;2;203;166;247m",     # Mauve
-        "accent": "\x1b[38;2;137;180;250m",     # Blue
-        "success": "\x1b[38;2;166;227;161m",    # Green
-        "warning": "\x1b[38;2;250;179;135m",    # Peach
-        "danger": "\x1b[38;2;243;139;168m",     # Red
-        "muted": "\x1b[38;2;147;153;178m",      # Overlay0
+        "border": "\x1b[38;2;203;166;247m",
+        "accent": "\x1b[38;2;137;180;250m",
+        "success": "\x1b[38;2;166;227;161m",
+        "warning": "\x1b[38;2;250;179;135m",
+        "danger": "\x1b[38;2;243;139;168m",
+        "muted": "\x1b[38;2;147;153;178m",
         "fzf_color": "--color=bg+:#313244,bg:#1e1e2e,spinner:#f5e0dc,hl:#f38ba8,fg:#cdd6f4,header:#f38ba8,info:#cba6f7,pointer:#f5e0dc,marker:#b4befe,fg+:#cdd6f4,prompt:#cba6f7,hl+:#f38ba8,border:#89b4fa,preview-border:#89b4fa"
     },
     "tokyonight": {
@@ -147,7 +149,6 @@ def load_config(custom_path=None):
         except Exception as e:
             print(f"\x1b[33mAdvertencia: No se pudo leer {config_file}: {e}\x1b[0m", file=sys.stderr)
 
-    # Environment variables overrides
     if os.environ.get("JACKETT_URL"):
         config["jackett_url"] = os.environ["JACKETT_URL"]
     if os.environ.get("JACKETT_API_KEY"):
@@ -229,7 +230,7 @@ def format_eta(seconds):
     """Format ETA in seconds into human readable time (e.g. 45m 12s, 2h 10m)."""
     try:
         sec = int(seconds)
-        if sec < 0 or sec >= 8640000: # Over 100 days
+        if sec < 0 or sec >= 8640000:
             return "∞"
         if sec < 60:
             return f"{sec}s"
@@ -259,7 +260,6 @@ def copy_to_clipboard(text):
         return False
     payload = text.encode("utf-8")
 
-    # 1. Wayland wl-copy
     try:
         p = subprocess.run(["wl-copy"], input=payload, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -268,7 +268,6 @@ def copy_to_clipboard(text):
     except FileNotFoundError:
         pass
 
-    # 2. X11 xclip
     try:
         p = subprocess.run(["xclip", "-selection", "clipboard"], input=payload, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -277,7 +276,6 @@ def copy_to_clipboard(text):
     except FileNotFoundError:
         pass
 
-    # 3. X11 xsel
     try:
         p = subprocess.run(["xsel", "--clipboard", "--input"], input=payload, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -288,15 +286,16 @@ def copy_to_clipboard(text):
 
     return False
 
-def send_notification(title, body, icon="qbittorrent"):
-    """Send desktop notification safely without shell injection vulnerabilities."""
+def send_notification(title, body, icon="qbittorrent", image_path=None):
+    """Send desktop notification with support for full-color graphic poster icons."""
     try:
-        subprocess.run(
-            ["notify-send", "-a", "qjackett", "-i", icon, title, body],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        cmd = ["notify-send", "-a", "qjackett"]
+        if image_path and os.path.exists(image_path):
+            cmd.extend(["-i", image_path])
+        elif icon:
+            cmd.extend(["-i", icon])
+        cmd.extend([title, body])
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         pass
 
@@ -348,7 +347,7 @@ def boost_magnet_link(link, enabled=True):
 
 
 # ==============================================================================
-# TMDB Metadata & Terminal Graphics Engine (Chafa / Kitty)
+# TMDB Metadata, Posters & Official Trailer Engine
 # ==============================================================================
 
 def clean_title_for_tmdb(title):
@@ -384,7 +383,7 @@ def get_tmdb_metadata(title, cat_key="movies", api_key=TMDB_API_KEY):
         params["first_air_date_year" if is_tv else "year"] = year
 
     url = f"https://api.themoviedb.org/3/search/{endpoint}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.5"})
+    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.6"})
     try:
         with urllib.request.urlopen(req, timeout=2.5) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
@@ -407,6 +406,44 @@ def get_tmdb_metadata(title, cat_key="movies", api_key=TMDB_API_KEY):
         pass
     return None
 
+def get_tmdb_trailer_url(item_id, is_tv=False, api_key=TMDB_API_KEY):
+    """Fetch official YouTube trailer URL for a title from TMDB."""
+    if not item_id or not api_key:
+        return None
+    endpoint = "tv" if is_tv else "movie"
+    url = f"https://api.themoviedb.org/3/{endpoint}/{item_id}/videos?api_key={api_key}&language=es-ES"
+    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.6"})
+    try:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            videos = data.get("results") or []
+            # Check for YouTube trailer/teaser
+            yt = next((v for v in videos if v.get("site") == "YouTube" and v.get("type") in ("Trailer", "Teaser")), None)
+            if not yt:
+                # Fallback to English
+                url_en = f"https://api.themoviedb.org/3/{endpoint}/{item_id}/videos?api_key={api_key}"
+                with urllib.request.urlopen(urllib.request.Request(url_en, headers={"User-Agent": "qjackett/1.6"}), timeout=2.5) as r2:
+                    d2 = json.loads(r2.read().decode("utf-8", errors="ignore"))
+                    yt = next((v for v in (d2.get("results") or []) if v.get("site") == "YouTube"), None)
+            if yt and yt.get("key"):
+                return f"https://www.youtube.com/watch?v={yt['key']}"
+    except Exception:
+        pass
+    return None
+
+def get_tmdb_trending(api_key=TMDB_API_KEY):
+    """Retrieve top trending movies and series of the week from TMDB."""
+    if not api_key:
+        return []
+    url = f"https://api.themoviedb.org/3/trending/all/week?api_key={api_key}&language=es-ES"
+    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.6"})
+    try:
+        with urllib.request.urlopen(req, timeout=3.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            return data.get("results") or []
+    except Exception:
+        return []
+
 def render_poster_terminal(poster_url, title_id):
     """Download poster to cache and render high-resolution graphic thumbnail in terminal."""
     if not poster_url or not shutil.which("chafa"):
@@ -417,7 +454,7 @@ def render_poster_terminal(poster_url, title_id):
         cached_path = os.path.join(DEFAULT_POSTERS_DIR, filename)
 
         if not os.path.exists(cached_path):
-            req = urllib.request.Request(poster_url, headers={"User-Agent": "qjackett/1.5"})
+            req = urllib.request.Request(poster_url, headers={"User-Agent": "qjackett/1.6"})
             with urllib.request.urlopen(req, timeout=3) as resp, open(cached_path, "wb") as f:
                 f.write(resp.read())
 
@@ -480,7 +517,6 @@ def get_arr_config(service):
                 pass
         return f"http://127.0.0.1:{port}", api_key
 
-    # Radarr / Sonarr / Lidarr XML config
     xml_path = os.path.expanduser(f"~/.config/{service.capitalize()}/config.xml")
     if os.path.exists(xml_path):
         try:
@@ -527,7 +563,7 @@ def push_to_arr(item, config):
     req = urllib.request.Request(
         url,
         data=payload,
-        headers={"Content-Type": "application/json", "X-Api-Key": api_key, "User-Agent": "qjackett/1.5"}
+        headers={"Content-Type": "application/json", "X-Api-Key": api_key, "User-Agent": "qjackett/1.6"}
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -800,7 +836,7 @@ def search_indexer(indexer, query, api_key, jackett_url, timeout=5.0):
     encoded_query = urllib.parse.quote(query)
     base_url = jackett_url.rstrip("/")
     url = f"{base_url}/api/v2.0/indexers/{indexer}/results?apikey={api_key}&Query={encoded_query}"
-    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.5 (TUI; Linux)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.6 (TUI; Linux)"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
@@ -811,15 +847,20 @@ def search_indexer(indexer, query, api_key, jackett_url, timeout=5.0):
     except Exception:
         return []
 
-def search_bitmagnet(query, base_url="http://127.0.0.1:3333", limit=80, timeout=3.5):
+def search_bitmagnet(query, base_url="http://127.0.0.1:3333", limit=80, timeout=3.5, info_hash=None):
     """Query BitMagnet GraphQL endpoint for rapid local DHT torrent results."""
     graphql_url = f"{base_url.rstrip('/')}/graphql"
-    escaped_query = json.dumps(query)
+    if info_hash:
+        escaped_hash = json.dumps(info_hash.lower())
+        search_arg = f"infoHashes: [{escaped_hash}]"
+    else:
+        escaped_query = json.dumps(query)
+        search_arg = f"queryString: {escaped_query}, limit: {limit}"
+
     gql_query = f"""{{
       torrentContent {{
         search(input: {{
-          queryString: {escaped_query},
-          limit: {limit}
+          {search_arg}
         }}) {{
           items {{
             infoHash
@@ -847,7 +888,7 @@ def search_bitmagnet(query, base_url="http://127.0.0.1:3333", limit=80, timeout=
     req = urllib.request.Request(
         graphql_url,
         data=req_body,
-        headers={"Content-Type": "application/json", "User-Agent": "qjackett/1.5"}
+        headers={"Content-Type": "application/json", "User-Agent": "qjackett/1.6"}
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -857,10 +898,10 @@ def search_bitmagnet(query, base_url="http://127.0.0.1:3333", limit=80, timeout=
             for it in items:
                 t = it.get("torrent") or {}
                 title = it.get("title") or t.get("name") or "Sin título"
-                info_hash = (it.get("infoHash") or "").lower()
+                h = (it.get("infoHash") or "").lower()
                 magnet = t.get("magnetUri") or ""
-                if not magnet and info_hash:
-                    magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(title)}"
+                if not magnet and h:
+                    magnet = f"magnet:?xt=urn:btih:{h}&dn={urllib.parse.quote(title)}"
                 files = t.get("files") or []
                 files_cnt = t.get("filesCount") or len(files)
                 results.append({
@@ -870,7 +911,7 @@ def search_bitmagnet(query, base_url="http://127.0.0.1:3333", limit=80, timeout=
                     "Seeders": t.get("seeders") or 0,
                     "Peers": t.get("leechers") or 0,
                     "MagnetUri": magnet,
-                    "InfoHash": info_hash,
+                    "InfoHash": h,
                     "Files": files_cnt,
                     "_files_list": files,
                     "CategoryDesc": it.get("contentType") or "other",
@@ -908,7 +949,7 @@ class QBittorrentClient:
         req = urllib.request.Request(
             login_url,
             data=post_data,
-            headers={"User-Agent": "qjackett/1.5", "Referer": self.base_url}
+            headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url}
         )
         try:
             with self.opener.open(req, timeout=5) as resp:
@@ -947,7 +988,7 @@ class QBittorrentClient:
         req = urllib.request.Request(
             add_url,
             data=post_data,
-            headers={"User-Agent": "qjackett/1.5", "Referer": self.base_url}
+            headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url}
         )
 
         try:
@@ -975,7 +1016,7 @@ class QBittorrentClient:
         url = f"{self.base_url}/api/v2/torrents/info?filter={filter}"
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "qjackett/1.5", "Referer": self.base_url}
+            headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url}
         )
         try:
             with self.opener.open(req, timeout=5) as resp:
@@ -992,10 +1033,53 @@ class QBittorrentClient:
         except Exception:
             return []
 
+    def get_categories(self):
+        """Retrieve configured categories dictionary from qBittorrent."""
+        url = f"{self.base_url}/api/v2/torrents/categories"
+        req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url})
+        try:
+            with self.opener.open(req, timeout=4) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            return {}
+
+    def get_free_disk_space(self):
+        """Retrieve real free disk space on qBittorrent download drive."""
+        url = f"{self.base_url}/api/v2/sync/maindata"
+        req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url})
+        try:
+            with self.opener.open(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                free = (data.get("server_state") or {}).get("free_space_on_disk")
+                if free is not None:
+                    return int(free)
+        except Exception:
+            pass
+        # Fallback to local user Downloads directory
+        try:
+            return shutil.disk_usage(os.path.expanduser("~/Descargas")).free
+        except Exception:
+            return None
+
+    def delete_torrents(self, hashes, delete_files=False):
+        """Delete torrents from qBittorrent, optionally deleting disk files."""
+        url = f"{self.base_url}/api/v2/torrents/delete"
+        h_str = "|".join(hashes) if isinstance(hashes, list) else str(hashes)
+        post_data = urllib.parse.urlencode({
+            "hashes": h_str,
+            "deleteFiles": "true" if delete_files else "false"
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=post_data, headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url})
+        try:
+            with self.opener.open(req, timeout=5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
     def get_torrent_files(self, info_hash):
         """Retrieve file list for a specific torrent in qBittorrent."""
         url = f"{self.base_url}/api/v2/torrents/files?hash={info_hash}"
-        req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.5", "Referer": self.base_url})
+        req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url})
         try:
             with self.opener.open(req, timeout=5) as resp:
                 return json.loads(resp.read().decode("utf-8", errors="ignore"))
@@ -1011,7 +1095,7 @@ class QBittorrentClient:
             "id": ids_str,
             "priority": str(priority)
         }).encode("utf-8")
-        req = urllib.request.Request(url, data=post_data, headers={"User-Agent": "qjackett/1.5", "Referer": self.base_url})
+        req = urllib.request.Request(url, data=post_data, headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url})
         try:
             with self.opener.open(req, timeout=5) as resp:
                 return resp.status == 200
@@ -1022,7 +1106,7 @@ class QBittorrentClient:
         """Resume a torrent by hash."""
         url = f"{self.base_url}/api/v2/torrents/resume"
         post_data = urllib.parse.urlencode({"hashes": info_hash}).encode("utf-8")
-        req = urllib.request.Request(url, data=post_data, headers={"User-Agent": "qjackett/1.5", "Referer": self.base_url})
+        req = urllib.request.Request(url, data=post_data, headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url})
         try:
             with self.opener.open(req, timeout=5) as resp:
                 return resp.status == 200
@@ -1034,7 +1118,7 @@ class QBittorrentClient:
         url = f"{self.base_url}/api/v2/transfer/info"
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "qjackett/1.5", "Referer": self.base_url}
+            headers={"User-Agent": "qjackett/1.6", "Referer": self.base_url}
         )
         try:
             with self.opener.open(req, timeout=4) as resp:
@@ -1058,7 +1142,6 @@ def handle_preview(idx_str, cache_file):
             return
         r = data[idx]
 
-        # Clear previous graphics in Kitty terminal to prevent lingering overlays
         if bool(os.environ.get("KITTY_PID") or os.environ.get("TERM") == "xterm-kitty" or os.environ.get("TERM_PROGRAM") == "kitty"):
             if hasattr(sys.stdout, "buffer"):
                 sys.stdout.buffer.write(b"\x1b_Ga=d,d=A\x1b\\")
@@ -1093,20 +1176,19 @@ def handle_preview(idx_str, cache_file):
         tags = r.get("_tags", [])
         source = r.get("_source", "jackett")
 
-        # Swarm health
         health_bar = render_health_bar(seeds, peers, width=22)
 
-        # Heuristic Security Check
         sec_code, sec_badge, sec_msg = check_security_status(
             title, size_bytes, cat_key, files_list=files_list, seeders=seeds, leechers=peers, tracker=tracker
         )
 
-        # TMDB Poster & Ficha
         tmdb_info = get_tmdb_metadata(title, cat_key)
+        poster_file_path = None
         if tmdb_info and tmdb_info.get("poster_url"):
             render_poster_terminal(tmdb_info["poster_url"], tmdb_info["id"])
+            poster_file_path = os.path.join(DEFAULT_POSTERS_DIR, f"{tmdb_info['id']}.jpg")
+            r["_cached_poster"] = poster_file_path
 
-        # Improvement 2: Modern Rounded Cinema Box Header
         box_width = 56
         print(f"\x1b[1;36m╭{'─' * box_width}╮\x1b[0m")
         print(f"\x1b[1;36m│\x1b[0m \x1b[1;37m{title[:box_width-2]:<{box_width-2}}\x1b[0m \x1b[1;36m│\x1b[0m")
@@ -1114,7 +1196,6 @@ def handle_preview(idx_str, cache_file):
             print(f"\x1b[1;36m│\x1b[0m \x1b[1;37m{title[box_width-2:box_width*2-4]:<{box_width-2}}\x1b[0m \x1b[1;36m│\x1b[0m")
         print(f"\x1b[1;36m╰{'─' * box_width}╯\x1b[0m")
 
-        # TMDB Star Rating & Spanish Synopsis Card
         if tmdb_info:
             vote = float(tmdb_info.get("vote_average") or 0)
             stars_filled = int(round(vote / 2))
@@ -1124,7 +1205,6 @@ def handle_preview(idx_str, cache_file):
                 desc_lines = tmdb_info['overview'][:200].strip()
                 print(f" \x1b[3m{desc_lines}...\x1b[0m\n")
 
-        # Improvement 2: Color Tech Pills
         if tags:
             pills = []
             for t in tags:
@@ -1140,7 +1220,6 @@ def handle_preview(idx_str, cache_file):
                     pills.append(f"\x1b[44;37m {t} \x1b[0m")
             print(" " + " ".join(pills) + "\n")
 
-        # Security Alert banner
         if sec_code == "danger":
             print(f" \x1b[1;41;37m {sec_badge} \x1b[0m \x1b[1;31m{sec_msg}\x1b[0m\n")
         elif sec_code == "warning":
@@ -1163,7 +1242,6 @@ def handle_preview(idx_str, cache_file):
         if files_cnt and str(files_cnt) != "0":
             print(f" \x1b[1m🗂️  Archivos:\x1b[0m    {files_cnt}")
 
-        # Files Tree Inspector
         if files_list:
             print(f"\n \x1b[1;34m🗂️  Contenido del Torrent ({len(files_list)} archivos):\x1b[0m")
             for fl in files_list[:6]:
@@ -1178,7 +1256,6 @@ def handle_preview(idx_str, cache_file):
         if details_url:
             print(f" \x1b[1m🌐 Web/Ficha:\x1b[0m   \x1b[4;34m{details_url[:60]}\x1b[0m")
 
-        # Improvement 5: Streamlined sleek footer without clutter
         print(f"\n\x1b[90m{'─' * box_width}\x1b[0m")
         print(" \x1b[1;33mPulsa [?] o [F12] para ver todos los atajos | [ESC] Salir\x1b[0m")
     except Exception as e:
@@ -1193,7 +1270,9 @@ def handle_help():
     print("│  \x1b[1;32m[ENTER]\x1b[0m      Descargar torrent completo en qBittorrent    │")
     print("│  \x1b[1;36m[TAB]\x1b[0m        Marcar selección múltiple                    │")
     print("│  \x1b[1;32m[CTRL + V]\x1b[0m   Descarga SECUENCIAL para streaming (mpv)     │")
+    print("│  \x1b[1;33m[ALT + T]\x1b[0m    Reproducir TRÁILER oficial en mpv / ventana  │")
     print("│  \x1b[1;33m[CTRL + E]\x1b[0m   Descarga SELECTIVA de archivos/episodios     │")
+    print("│  \x1b[1;36m[CTRL + G]\x1b[0m   Elegir CATEGORÍA/carpeta de qBittorrent      │")
     print("│  \x1b[1;35m[CTRL + R]\x1b[0m   Enviar release a Radarr / Sonarr / Lidarr    │")
     print("│  \x1b[1;35m[CTRL + U]\x1b[0m   Buscar subtítulos en español (Bazarr)        │")
     print("│  \x1b[1;33m[CTRL + P]\x1b[0m   Descargar en estado PAUSADO                  │")
@@ -1204,12 +1283,43 @@ def handle_help():
     print("│  \x1b[1;34m[CTRL + D]\x1b[0m   Monitor en vivo de descargas qBittorrent     │")
     print("│  \x1b[1;34m[CTRL + O]\x1b[0m   Abrir ficha web en el navegador              │")
     print("│  \x1b[1;33m[F1..F5]\x1b[0m     Filtrar categoría (Películas/Series/Música)  │")
+    print("│  \x1b[1;33m[F6]\x1b[0m         Cartelera de ESTRENOS y Tendencias semanales │")
     print("│  \x1b[1;33m[CTRL + S]\x1b[0m   Cambiar ordenación (Semillas/Tamaño/Fecha)   │")
     print("│  \x1b[1;36m[F9/ALT+P]\x1b[0m   Cambiar vista previa (Derecha/Abajo/Oculto)  │")
     print("│  \x1b[1;36m[F10]\x1b[0m        Ocultar / Mostrar panel de vista previa      │")
     print("│  \x1b[1;33m[?] / [F12]\x1b[0m  Abrir esta ventana de ayuda                  │")
     print("│  \x1b[1;31m[ESC]\x1b[0m        Salir                                        │")
     print(f"\x1b[1;36m╰{border}╯\x1b[0m")
+
+def handle_trailer(idx_str, cache_file):
+    """Play official movie or series trailer via mpv or browser."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            title = r.get("Title", "Movie")
+            cat_key = r.get("_cat_key", "movies")
+            tmdb_info = get_tmdb_metadata(title, cat_key)
+            if tmdb_info and tmdb_info.get("id"):
+                trailer_url = get_tmdb_trailer_url(tmdb_info["id"], is_tv=tmdb_info.get("is_tv", False))
+                if trailer_url:
+                    send_notification("qJackett Tráiler", f"🎬 Abriendo tráiler oficial:\n{tmdb_info['title']}", icon="video-x-generic")
+                    # Try mpv first with floating window geometry
+                    try:
+                        subprocess.Popen(
+                            ["mpv", "--geometry=60%x60%", "--title=qJackett Trailer", trailer_url],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                        return
+                    except FileNotFoundError:
+                        pass
+                    open_url_in_browser(trailer_url)
+                else:
+                    send_notification("qJackett Tráiler", f"No se encontró tráiler para:\n{title[:50]}", icon="dialog-warning")
+    except Exception as e:
+        print(f"Error reproduciendo tráiler: {e}")
 
 def handle_files(idx_str, cache_file):
     """Display full files inspector for selected torrent."""
@@ -1244,7 +1354,8 @@ def handle_copy_magnet(idx_str, cache_file):
             if link:
                 copy_to_clipboard(link)
                 title = r.get("Title", "Torrent")
-                send_notification("qJackett", f"🧲 Magnet copiado:\n{title[:60]}", icon="edit-copy")
+                poster = r.get("_cached_poster")
+                send_notification("qJackett", f"🧲 Magnet copiado:\n{title[:60]}", icon="edit-copy", image_path=poster)
     except Exception:
         pass
 
@@ -1289,8 +1400,9 @@ def handle_bookmark(idx_str, cache_file):
             r = data[idx]
             ok, msg = save_bookmark(r)
             title = r.get("Title", "Torrent")
+            poster = r.get("_cached_poster")
             if ok:
-                send_notification("qJackett - Marcadores", f"⭐ Guardado en Marcadores:\n{title[:60]}", icon="emblem-favorite")
+                send_notification("qJackett - Marcadores", f"⭐ Guardado en Marcadores:\n{title[:60]}", icon="emblem-favorite", image_path=poster)
             else:
                 send_notification("qJackett - Marcadores", f"ℹ️ {msg}:\n{title[:60]}", icon="dialog-information")
     except Exception:
@@ -1314,9 +1426,10 @@ def handle_stream(idx_str, cache_file, config):
                 tags = ["qjackett", "stream"]
                 ok = qb.add_torrent(link, paused=False, sequential=True, first_last_piece=True, tags=tags)
                 title = r.get("Title", "Torrent")
+                poster = r.get("_cached_poster")
                 copy_to_clipboard(link)
                 if ok:
-                    send_notification("qJackett - Streaming", f"🎬 Descarga secuencial activa en qBittorrent:\n{title[:60]}", icon="media-playback-start")
+                    send_notification("qJackett - Streaming", f"🎬 Descarga secuencial activa en qBittorrent:\n{title[:60]}", icon="media-playback-start", image_path=poster)
     except Exception:
         pass
 
@@ -1330,8 +1443,9 @@ def handle_push_arr(idx_str, cache_file, config):
             r = data[idx]
             ok, msg = push_to_arr(r, config)
             title = r.get("Title", "Release")
+            poster = r.get("_cached_poster")
             if ok:
-                send_notification("qJackett - *Arr", f"🍿 {msg}:\n{title[:60]}", icon="media-optical")
+                send_notification("qJackett - *Arr", f"🍿 {msg}:\n{title[:60]}", icon="media-optical", image_path=poster)
             else:
                 send_notification("qJackett - *Arr Error", f"❌ {msg}:\n{title[:60]}", icon="dialog-error")
     except Exception:
@@ -1417,9 +1531,49 @@ def handle_select_files(idx_str, cache_file, config):
             qb.set_file_priorities(info_hash, ignored, priority=0)
             qb.set_file_priorities(info_hash, list(chosen_indices), priority=1)
             qb.resume_torrent(info_hash)
-            send_notification("qJackett - Descarga Selectiva", f"✔ Descargando {len(chosen_indices)}/{len(files)} archivos de:\n{title[:50]}")
+            poster = r.get("_cached_poster")
+            send_notification("qJackett - Descarga Selectiva", f"✔ Descargando {len(chosen_indices)}/{len(files)} archivos de:\n{title[:50]}", image_path=poster)
     except Exception as e:
         print(f"Error en descarga selectiva: {e}")
+
+def handle_category_picker(idx_str, cache_file, config):
+    """Interactive category selector menu for qBittorrent."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if idx < 0 or idx >= len(data):
+            return
+        r = data[idx]
+        title = r.get("Title", "Torrent")
+        link = boost_magnet_link(r.get("MagnetUri") or r.get("Link"), enabled=config.get("tracker_booster", True))
+
+        qb = QBittorrentClient(
+            base_url=config.get("qbittorrent_url", "http://127.0.0.1:8080"),
+            username=config.get("qbittorrent_username", ""),
+            password=config.get("qbittorrent_password", "")
+        )
+        cat_dict = qb.get_categories()
+        cat_list = list(cat_dict.keys()) if cat_dict else ["movies", "tv", "music", "games", "anime", "books"]
+
+        p = subprocess.Popen([
+            "fzf", "--ansi",
+            f"--header=ELIGE CATEGORÍA DE QBITTORRENT ({title[:40]}):",
+            "--prompt=📁 Categoría > "
+        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        out, _ = p.communicate(input="\n".join(["(Sin categoría)"] + cat_list))
+
+        if not out:
+            return
+        chosen = out.strip()
+        chosen_cat = None if chosen == "(Sin categoría)" else chosen
+
+        ok = qb.add_torrent(link, category=chosen_cat, paused=False)
+        poster = r.get("_cached_poster")
+        if ok:
+            send_notification("qJackett - Categoría", f"✔ Inyectado en categoría '{chosen}':\n{title[:50]}", image_path=poster)
+    except Exception as e:
+        print(f"Error seleccionando categoría: {e}")
 
 def handle_filter(cat_filter, cache_file, state_file=None):
     """Filter cached results dynamically and output formatted rows for fzf reload."""
@@ -1525,6 +1679,90 @@ def display_qbittorrent_downloads(qb_client):
 
         print(f"{st_fmt} \x1b[36m[{pbar}] {progress:>5.1f}%\x1b[0m \x1b[1m{name:<42}\x1b[0m \x1b[90m{size_str:>8} | {dls:>10} | ETA: {eta:<6}\x1b[0m")
 
+def run_torrent_cleaner(qb_client):
+    """Interactive torrent cleaner for qBittorrent via fzf."""
+    torrents = qb_client.get_torrents()
+    if not torrents:
+        print("\x1b[1;33mNo hay torrents para limpiar en qBittorrent.\x1b[0m")
+        return
+
+    fzf_lines = []
+    for t in torrents:
+        h = t.get("hash")
+        name = t.get("name", "Torrent")[:46]
+        sz = format_size(t.get("size", 0))
+        ratio = float(t.get("ratio") or 0)
+        progress = float(t.get("progress") or 0) * 100
+        st = t.get("state", "other")
+        fzf_lines.append(f"{h}\t[{progress:>5.1f}%] {sz:>9} (Ratio: {ratio:.2f})  {st:<12}  {name}")
+
+    p = subprocess.Popen([
+        "fzf", "--multi", "--ansi",
+        "--header=SELECCIONA TORRENTS A ELIMINAR CON [TAB] Y PULSA [ENTER]:",
+        "--delimiter=\t", "--with-nth=2.."
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    out, _ = p.communicate(input="\n".join(fzf_lines))
+
+    if not out:
+        return
+
+    chosen_hashes = []
+    for line in out.splitlines():
+        if "\t" in line:
+            chosen_hashes.append(line.split("\t")[0])
+
+    if not chosen_hashes:
+        return
+
+    print(f"\x1b[1;33m¿Deseas eliminar también los archivos descargados del DISCO? [s/N]:\x1b[0m ", end="", flush=True)
+    try:
+        ans = input().strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    delete_files = (ans in ("s", "si", "y", "yes"))
+    ok = qb_client.delete_torrents(chosen_hashes, delete_files=delete_files)
+    if ok:
+        print(f"\x1b[1;32m✔ Eliminados {len(chosen_hashes)} torrent(s) de qBittorrent{' (con archivos de disco)' if delete_files else ''}.\x1b[0m")
+    else:
+        print("\x1b[1;31mError al eliminar torrents de qBittorrent.\x1b[0m")
+
+def run_trending_browser(config, args, qb_client):
+    """Browse top trending movies and series of the week from TMDB."""
+    trending = get_tmdb_trending(config.get("tmdb_api_key", TMDB_API_KEY))
+    if not trending:
+        print("\x1b[1;33mNo se pudieron obtener las tendencias de TMDB en este momento.\x1b[0m")
+        return
+
+    fzf_lines = []
+    for it in trending:
+        t_title = it.get("title") or it.get("name") or "Sin título"
+        vote = float(it.get("vote_average") or 0)
+        stars = "★" * int(round(vote / 2)) + "☆" * (5 - int(round(vote / 2)))
+        media = "🎬 Película" if it.get("media_type") == "movie" else "📺 Serie"
+        date = it.get("release_date") or it.get("first_air_date") or ""
+        year = date[:4] if date else ""
+        fzf_lines.append(f"{t_title}\t{media:<11} {stars} {vote:.1f}/10  [{year:>4}]  {t_title}")
+
+    p = subprocess.Popen([
+        "fzf", "--ansi",
+        "--header=🔥 ESTRENOS Y TENDENCIAS DE LA SEMANA (Pulsa [ENTER] para buscar torrents):",
+        "--delimiter=\t", "--with-nth=2..",
+        "--prompt=🔥 Tendencias > "
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    out, _ = p.communicate(input="\n".join(fzf_lines))
+
+    if not out:
+        return
+    chosen_title = out.split("\t")[0].strip()
+    if chosen_title:
+        api_key = get_jackett_api_key(config)
+        filter_list = args.indexer.split(",") if getattr(args, "indexer", None) else None
+        indexers = get_configured_indexers(filter_list)
+        results = run_query(chosen_title, config, args, api_key, indexers)
+        if results:
+            run_fzf_tui(results, config, args, qb_client)
+
 
 # ==============================================================================
 # Search Runner & TUI Engine
@@ -1541,7 +1779,6 @@ def format_list_line(idx, r):
     fl = r.get("DownloadVolumeFactor", 1) == 0
     source = r.get("_source", "jackett")
 
-    # Security check badge
     sec_code, _, _ = check_security_status(
         title, int(r.get("Size") or 0), r.get("_cat_key", "other"),
         files_list=r.get("_files_list", []), seeders=seeds, leechers=peers, tracker=tracker
@@ -1572,7 +1809,6 @@ def format_list_line(idx, r):
     else:
         track_fmt = f"\x1b[35m[{tracker:<12}]\x1b[0m"
 
-    # Improvement 1: Fixed-width tech tags column so titles remain tabular and aligned
     tags = r.get("_tags", [])
     if tags:
         top_tags = " ".join([f"[{t}]" for t in tags[:2]])
@@ -1585,6 +1821,28 @@ def format_list_line(idx, r):
 
 def run_query(query_str, config, args, api_key, indexers, quiet=False):
     """Execute concurrent hybrid search across Jackett and BitMagnet."""
+    # Check if query is direct infohash or magnet link
+    info_hash_match = None
+    if query_str.startswith("magnet:?"):
+        m = re.search(r'urn:btih:([a-zA-Z0-9]+)', query_str)
+        if m:
+            info_hash_match = m.group(1).lower()
+    elif re.match(r'^[0-9a-fA-F]{40}$', query_str) or re.match(r'^[2-7a-zA-Z]{32}$', query_str):
+        info_hash_match = query_str.lower()
+
+    if info_hash_match:
+        if not quiet:
+            print(f"\x1b[1;36mResolviendo directamente por InfoHash [{info_hash_match[:12]}...] en BitMagnet DHT...\x1b[0m")
+        bm_url = config.get("bitmagnet_url", "http://127.0.0.1:3333")
+        bm_results = search_bitmagnet("", bm_url, limit=5, info_hash=info_hash_match)
+        if bm_results:
+            for r in bm_results:
+                badge, cat_key = get_category_badge(r.get("CategoryDesc"), None, r.get("Title", ""))
+                r["_badge"] = badge
+                r["_cat_key"] = cat_key
+                r["_tags"] = extract_tags(r.get("Title", ""))
+            return bm_results
+
     exclude_terms = list(config.get("default_exclude", []))
     if getattr(args, "exclude", None):
         exclude_terms.extend([t.strip().lower() for t in args.exclude.split(",") if t.strip()])
@@ -1717,45 +1975,43 @@ def run_fzf_tui(results, config, args, qb_client):
     py_exec = sys.executable
     script_path = os.path.abspath(sys.argv[0])
 
-    # Improvement 7: Theme handling
     theme_name = config.get("theme", "default").lower()
     theme_cfg = THEMES.get(theme_name, THEMES["default"])
     fzf_color_flag = theme_cfg.get("fzf_color", "")
 
     header_text = (
-        "ENTER: Descargar | TAB: Multi | CTRL+V: Stream | CTRL+E: Select | "
-        "CTRL+R: *Arr | CTRL+U: Subs | F1..F5: Filtros | CTRL+S: Orden | F9: Layout | ?: Ayuda"
+        "ENTER: Descargar | TAB: Multi | CTRL+V: Stream | ALT+T: Tráiler | CTRL+E: Select | "
+        "CTRL+G: Categoría | CTRL+R: *Arr | CTRL+U: Subs | F1..F5: Filtros | F6: Tendencias | ?: Ayuda"
     )
     fzf_cmd = [
         "fzf",
         "--ansi",
         "--multi",
-        "--expect=ctrl-p,ctrl-v,ctrl-e,ctrl-r,ctrl-u",
+        "--expect=ctrl-p,ctrl-v,ctrl-e,ctrl-r,ctrl-u,ctrl-g",
         "--delimiter=\t",
         "--with-nth=2..",
         "--prompt=🔍 [Todo | Semillas] > ",
         f"--header={header_text}",
         f"--preview={py_exec} {script_path} __preview__ {{1}} {cache_path}",
         "--preview-window=right:48%:wrap",
-        # Improvement 4: Layout switching hotkeys
         "--bind=f9:change-preview-window(down,45%|hidden|right,48%)",
         "--bind=alt-p:change-preview-window(down,45%|hidden|right,48%)",
         "--bind=f10:toggle-preview",
-        # Improvement 5: Modal help cheat sheet on ? / F12
         f"--bind=?:execute({py_exec} {script_path} __help__ | less -R)",
         f"--bind=f12:execute({py_exec} {script_path} __help__ | less -R)",
+        f"--bind=alt-t:execute-silent({py_exec} {script_path} __trailer__ {{1}} {cache_path})",
         f"--bind=ctrl-y:execute-silent({py_exec} {script_path} __copy_magnet__ {{1}} {cache_path})",
         f"--bind=ctrl-t:execute-silent({py_exec} {script_path} __copy_title__ {{1}} {cache_path})",
         f"--bind=ctrl-b:execute-silent({py_exec} {script_path} __bookmark__ {{1}} {cache_path})",
         f"--bind=ctrl-f:execute({py_exec} {script_path} __files__ {{1}} {cache_path} | less -R)",
         f"--bind=ctrl-d:execute({py_exec} {script_path} __downloads__ | less -R)",
         f"--bind=ctrl-o:execute-silent({py_exec} {script_path} __open_link__ {{1}} {cache_path})",
-        # Improvement 3: Dynamic Category & Prompt Reloads
         f"--bind=f1:change-prompt(🎬 Películas | Semillas > )+reload({py_exec} {script_path} __filter__ movies {cache_path} {state_path})",
         f"--bind=f2:change-prompt(📺 Series | Semillas > )+reload({py_exec} {script_path} __filter__ tv {cache_path} {state_path})",
         f"--bind=f3:change-prompt(🎵 Música | Semillas > )+reload({py_exec} {script_path} __filter__ music {cache_path} {state_path})",
         f"--bind=f4:change-prompt(🎮 Juegos | Semillas > )+reload({py_exec} {script_path} __filter__ games {cache_path} {state_path})",
         f"--bind=f5:change-prompt(🔍 Todo | Semillas > )+reload({py_exec} {script_path} __filter__ all {cache_path} {state_path})",
+        f"--bind=f6:execute({py_exec} {script_path} --trending)",
         f"--bind=alt-1:change-prompt(🎬 Películas | Semillas > )+reload({py_exec} {script_path} __filter__ movies {cache_path} {state_path})",
         f"--bind=alt-2:change-prompt(📺 Series | Semillas > )+reload({py_exec} {script_path} __filter__ tv {cache_path} {state_path})",
         f"--bind=alt-3:change-prompt(🎵 Música | Semillas > )+reload({py_exec} {script_path} __filter__ music {cache_path} {state_path})",
@@ -1791,6 +2047,10 @@ def run_fzf_tui(results, config, args, qb_client):
         idx_val = selected_lines[0].split("\t")[0]
         handle_select_files(idx_val, cache_path, config)
         return
+    elif key_pressed == "ctrl-g":
+        idx_val = selected_lines[0].split("\t")[0]
+        handle_category_picker(idx_val, cache_path, config)
+        return
     elif key_pressed == "ctrl-r":
         idx_val = selected_lines[0].split("\t")[0]
         handle_push_arr(idx_val, cache_path, config)
@@ -1803,7 +2063,6 @@ def run_fzf_tui(results, config, args, qb_client):
     is_stream = (key_pressed == "ctrl-v") or getattr(args, "stream", False)
     is_paused = (key_pressed == "ctrl-p") or getattr(args, "paused", False) or config.get("save_paused", False)
 
-    # Collect selected items
     selected_items = []
     for line in selected_lines:
         try:
@@ -1816,9 +2075,28 @@ def run_fzf_tui(results, config, args, qb_client):
     if not selected_items:
         return
 
-    # Improvement 6: Multi-selection counter with accumulated size
+    # Feature 3: Smart Free Disk Space Verification
     total_bytes = sum(int(item.get("Size") or 0) for item in selected_items)
     size_summary = format_size(total_bytes)
+
+    if config.get("check_disk_space", True):
+        free_bytes = qb_client.get_free_disk_space()
+        if free_bytes is not None:
+            if total_bytes > free_bytes:
+                print(f"\n\x1b[1;41;37m ⚠️ ALERTA DE ESPACIO EN DISCO \x1b[0m")
+                print(f"Espacio libre en disco: \x1b[1;31m{format_size(free_bytes)}\x1b[0m | Tamaño requerido: \x1b[1;33m{size_summary}\x1b[0m")
+                print("\x1b[33m¿Deseas continuar con la inyección a pesar del espacio insuficiente? [s/N]:\x1b[0m ", end="", flush=True)
+                try:
+                    ans = input().strip().lower()
+                    if ans not in ("s", "si", "y", "yes"):
+                        print("Descarga cancelada para proteger el almacenamiento.")
+                        return
+                except (KeyboardInterrupt, EOFError):
+                    return
+            else:
+                rem_bytes = free_bytes - total_bytes
+                print(f"\x1b[90m💾 Disco: {format_size(free_bytes)} libres (quedarán: {format_size(rem_bytes)})\x1b[0m")
+
     status_label = " (STREAMING SEQUENTIAL)" if is_stream else (" (PAUSADO)" if is_paused else "")
     print(f"\n\x1b[1;34mInyectando {len(selected_items)} torrent(s) a qBittorrent [Peso total: {size_summary}]{status_label}...\x1b[0m")
 
@@ -1860,21 +2138,20 @@ def run_fzf_tui(results, config, args, qb_client):
             failed_count += 1
             print(f"  \x1b[1;31m✘\x1b[0m {title[:65]} (Fallo al conectar)")
 
-    # Clipboard sync
     if added_magnets and config.get("auto_copy_magnet", True):
         copy_to_clipboard("\n".join(added_magnets))
 
-    # Notifications
     if config.get("enable_notifications", True):
+        poster_img = selected_items[0].get("_cached_poster") if selected_items else None
         if is_stream:
-            send_notification("Streaming Iniciado", f"{selected_items[0].get('Title')}\nDescarga secuencial activa", icon="media-playback-start")
+            send_notification("Streaming Iniciado", f"{selected_items[0].get('Title')}\nDescarga secuencial activa", icon="media-playback-start", image_path=poster_img)
         elif len(selected_items) == 1 and success_count == 1:
             it = selected_items[0]
             action_desc = "Torrent Añadido (Pausado)" if is_paused else "Torrent Añadido"
-            send_notification(action_desc, f"{it.get('Title')}\n{format_size(it.get('Size', 0))}", icon="qbittorrent")
+            send_notification(action_desc, f"{it.get('Title')}\n{format_size(it.get('Size', 0))}", icon="qbittorrent", image_path=poster_img)
         elif success_count > 0:
             action_desc = f"{success_count} Torrents Añadidos{' (Pausados)' if is_paused else ''}"
-            send_notification(action_desc, f"Se añadieron {success_count} torrents [{size_summary}] a qBittorrent", icon="qbittorrent")
+            send_notification(action_desc, f"Se añadieron {success_count} torrents [{size_summary}] a qBittorrent", icon="qbittorrent", image_path=poster_img)
 
     if success_count > 0 and failed_count == 0:
         if is_stream:
@@ -1908,7 +2185,7 @@ _qjackett() {{
     COMPREPLY=()
     cur="${{COMP_WORDS[COMP_CWORD]}}"
     prev="${{COMP_WORDS[COMP_CWORD-1]}}"
-    opts="-c --category -s --min-seeds -x --exclude --min-size --max-size -i --indexer --source --sort -r --reverse -p --paused --stream -d --downloads -b --bookmarks -l --loop --json --quiet --watch --interval --theme --completions --init-config -v --version -h --help"
+    opts="-c --category -s --min-seeds -x --exclude --min-size --max-size -i --indexer --source --sort -r --reverse -p --paused --stream -d --downloads -b --bookmarks --trending --clean -l --loop --json --quiet --watch --interval --theme --completions --init-config -v --version -h --help"
 
     case "$prev" in
         -c|--category)
@@ -1960,6 +2237,8 @@ _arguments -s \\
   '--stream[Descarga secuencial para streaming]' \\
   '(-d --downloads)'{{-d,--downloads}}'[Monitor de descargas de qBittorrent]' \\
   '(-b --bookmarks)'{{-b,--bookmarks}}'[Ver marcadores guardados]' \\
+  '--trending[Cartelera de estrenos y tendencias]' \\
+  '--clean[Limpiar torrents completados o en error]' \\
   '--watch[Modo vigilancia en segundo plano]' \\
   '--interval[Intervalo de vigilancia]:tiempo:' \\
   '--json[Salida estructurada JSON]' \\
@@ -1985,6 +2264,8 @@ complete -c qjackett -s p -l paused -d "Descargar pausado"
 complete -c qjackett -l stream -d "Streaming secuencial"
 complete -c qjackett -s d -l downloads -d "Monitor de descargas"
 complete -c qjackett -s b -l bookmarks -d "Ver marcadores"
+complete -c qjackett -l trending -d "Estrenos y tendencias"
+complete -c qjackett -l clean -d "Limpiar descargas"
 complete -c qjackett -l watch -d "Vigilancia periódica"
 complete -c qjackett -l json -d "Salida JSON"
 complete -c qjackett -s q -l quiet -d "Modo silencioso"
@@ -2040,7 +2321,8 @@ def run_watcher(query_str, interval_sec, config, args, api_key, indexers, qb_cli
                     ok = qb_client.add_torrent(link, category=category, tags=tags, paused=args.paused)
                     if ok:
                         print(f"  \x1b[1;32m✔ Inyectado:\x1b[0m {title[:60]}")
-                        send_notification("qJackett Watcher", f"Nuevo release inyectado:\n{title[:60]}", icon="software-update-available")
+                        poster = r.get("_cached_poster")
+                        send_notification("qJackett Watcher", f"Nuevo release inyectado:\n{title[:60]}", icon="software-update-available", image_path=poster)
 
                 try:
                     with open(DEFAULT_WATCHER_SEEN_PATH, "w", encoding="utf-8") as f:
@@ -2066,6 +2348,9 @@ def main():
             sys.exit(0)
         elif subcmd == "__help__":
             handle_help()
+            sys.exit(0)
+        elif subcmd == "__trailer__" and len(sys.argv) >= 4:
+            handle_trailer(sys.argv[2], sys.argv[3])
             sys.exit(0)
         elif subcmd == "__files__" and len(sys.argv) >= 4:
             handle_files(sys.argv[2], sys.argv[3])
@@ -2112,7 +2397,7 @@ def main():
         description=f"qJackett v{VERSION}: Buscador interactivo TUI supercargado (Jackett + BitMagnet + fzf + qBittorrent + TMDB)",
         usage="%(prog)s [opciones] [termino_de_busqueda]"
     )
-    parser.add_argument("query", nargs="*", help="Término o título a buscar")
+    parser.add_argument("query", nargs="*", help="Término, título, enlace magnet o infohash a buscar")
     parser.add_argument("-c", "--category",
                         choices=["movies", "tv", "anime", "games", "music", "books", "apps", "xxx"],
                         help="Filtrar por categoría")
@@ -2132,6 +2417,8 @@ def main():
     parser.add_argument("--stream", action="store_true", help="Inyectar con descarga secuencial para streaming inmediato (mpv)")
     parser.add_argument("-d", "--downloads", action="store_true", help="Ver monitor de descargas activas en qBittorrent")
     parser.add_argument("-b", "--bookmarks", action="store_true", help="Explorar y gestionar torrents guardados en Marcadores")
+    parser.add_argument("--trending", action="store_true", help="Ver cartelera de estrenos y películas/series en tendencia")
+    parser.add_argument("--clean", action="store_true", help="Limpiar y gestionar descargas completadas en qBittorrent")
     parser.add_argument("--json", action="store_true", help="Emitir resultados formateados en JSON directamente para scripting/jq")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suprimir mensajes informativos en terminal")
     parser.add_argument("--watch", action="store_true", help="Modo vigilancia en segundo plano para nuevos releases")
@@ -2160,6 +2447,14 @@ def main():
 
     if args.downloads:
         display_qbittorrent_downloads(qb_client)
+        sys.exit(0)
+
+    if args.clean:
+        run_torrent_cleaner(qb_client)
+        sys.exit(0)
+
+    if args.trending:
+        run_trending_browser(config, args, qb_client)
         sys.exit(0)
 
     if args.bookmarks:
