@@ -350,5 +350,204 @@ class TestQueryRunnerAndDeduplication(unittest.TestCase):
             self.assertEqual(results[0]["Title"], "Release.Medium")
 
 
+class TestV13Features(unittest.TestCase):
+    def test_search_bitmagnet(self):
+        mock_response = {
+            "data": {
+                "torrentContent": {
+                    "search": {
+                        "items": [
+                            {
+                                "infoHash": "abc12345",
+                                "contentType": "movie",
+                                "title": "Inception.1080p.mkv",
+                                "torrent": {
+                                    "name": "Inception",
+                                    "size": 2500000000,
+                                    "filesCount": 2,
+                                    "seeders": 150,
+                                    "leechers": 20,
+                                    "magnetUri": "magnet:?xt=urn:btih:abc12345",
+                                    "files": [
+                                        {"index": 0, "path": "Inception.mkv", "size": 2490000000},
+                                        {"index": 1, "path": "Inception.srt", "size": 10000000}
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(mock_response).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            res = qj.search_bitmagnet("Inception")
+            self.assertEqual(len(res), 1)
+            item = res[0]
+            self.assertEqual(item["Title"], "Inception.1080p.mkv")
+            self.assertEqual(item["Tracker"], "BitMagnet (DHT)")
+            self.assertEqual(item["Seeders"], 150)
+            self.assertEqual(item["_source"], "bitmagnet")
+            self.assertEqual(len(item["_files_list"]), 2)
+
+    def test_security_heuristics(self):
+        # 1. Malware executable in movie
+        code, badge, msg = qj.check_security_status("Avengers.2024.1080p.exe", 1000000, "movies")
+        self.assertEqual(code, "danger")
+        self.assertIn("MALWARE", badge)
+
+        # 2. Fake small size for 4K
+        code, badge, msg = qj.check_security_status("Dune.2024.2160p.4K.BluRay", 5 * 1024**2, "movies")
+        self.assertEqual(code, "danger")
+        self.assertIn("TAMAÑO ANÓMALO", badge)
+
+        # 3. Fake swarm
+        code, badge, msg = qj.check_security_status("Linux.ISO", 2 * 1024**3, "apps", seeders=0, leechers=800)
+        self.assertEqual(code, "warning")
+        self.assertIn("ENJAMBRE FALSO", badge)
+
+        # 4. Verified tracker
+        code, badge, msg = qj.check_security_status("Good.Movie.1080p", 2 * 1024**3, "movies", tracker="BitMagnet")
+        self.assertEqual(code, "verified")
+        self.assertIn("Verificado", badge)
+
+    def test_qbittorrent_sequential_and_torrents(self):
+        qb = qj.QBittorrentClient("http://127.0.0.1:8080")
+        with patch.object(qb.opener, "open") as mock_open:
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_open.return_value.__enter__.return_value = mock_resp
+
+            ok = qb.add_torrent("magnet:?xt=urn:btih:xyz", sequential=True, first_last_piece=True)
+            self.assertTrue(ok)
+
+            # Verify POST payload sent sequentialDownload and firstLastPiecePrio
+            args, kwargs = mock_open.call_args
+            req = args[0]
+            data = req.data.decode("utf-8")
+            self.assertIn("sequentialDownload=true", data)
+            self.assertIn("firstLastPiecePrio=true", data)
+
+    def test_bookmarks_system(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+            b_path = tf.name
+
+        try:
+            item = {"Title": "Test.Torrent", "InfoHash": "hash123", "MagnetUri": "magnet:1"}
+            ok, msg = qj.save_bookmark(item, path=b_path)
+            self.assertTrue(ok)
+
+            # Duplicate prevention
+            ok2, msg2 = qj.save_bookmark(item, path=b_path)
+            self.assertFalse(ok2)
+
+            loaded = qj.load_bookmarks(path=b_path)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["Title"], "Test.Torrent")
+        finally:
+            if os.path.exists(b_path):
+                os.remove(b_path)
+
+
+class TestV14Features(unittest.TestCase):
+    def test_boost_magnet_link(self):
+        raw_magnet = "magnet:?xt=urn:btih:1234567890abcdef&dn=Ubuntu"
+        boosted = qj.boost_magnet_link(raw_magnet, enabled=True)
+        self.assertIn("tr=udp%3A//tracker.opentrackr.org", boosted)
+        self.assertIn("dn=Ubuntu", boosted)
+
+        # Idempotence: calling boost again should not duplicate existing trackers
+        boosted_twice = qj.boost_magnet_link(boosted, enabled=True)
+        self.assertEqual(boosted.count("tracker.opentrackr.org"), 1)
+
+    def test_clean_title_for_tmdb(self):
+        name, year = qj.clean_title_for_tmdb("Dune.Part.Two.2024.2160p.UHD.Remux.DV.HDR10+.HEVC")
+        self.assertEqual(name, "Dune Part Two")
+        self.assertEqual(year, "2024")
+
+        name, year = qj.clean_title_for_tmdb("Severance.S01E01.1080p.WEB-DL.x265")
+        self.assertEqual(name, "Severance")
+        self.assertIsNone(year)
+
+        name, year = qj.clean_title_for_tmdb("Oppenheimer (2023) [BluRay 1080p]")
+        self.assertEqual(name, "Oppenheimer")
+        self.assertEqual(year, "2023")
+
+    def test_tmdb_metadata(self):
+        mock_response = {
+            "results": [
+                {
+                    "id": 693134,
+                    "title": "Dune: Parte dos",
+                    "original_title": "Dune: Part Two",
+                    "overview": "El viaje mítico de Paul Atreides...",
+                    "vote_average": 8.2,
+                    "release_date": "2024-02-27",
+                    "poster_path": "/xCHmhHeO7aOCMlzcNukGH6Q7EiD.jpg"
+                }
+            ]
+        }
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(mock_response).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            meta = qj.get_tmdb_metadata("Dune.Part.Two.2024.1080p")
+            self.assertIsNotNone(meta)
+            self.assertEqual(meta["title"], "Dune: Parte dos")
+            self.assertEqual(meta["vote_average"], 8.2)
+            self.assertIn("xCHmhHeO7aOCMlzcNukGH6Q7EiD.jpg", meta["poster_url"])
+
+    def test_arr_suite_push(self):
+        item = {
+            "Title": "Gladiator.II.2024.1080p",
+            "MagnetUri": "magnet:?xt=urn:btih:gladiator",
+            "Size": 4500000000,
+            "InfoHash": "gladiator",
+            "Tracker": "YTS",
+            "_cat_key": "movies"
+        }
+        config = {"radarr_api_key": "test_radarr_key"}
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.status = 201
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            ok, msg = qj.push_to_arr(item, config)
+            self.assertTrue(ok)
+            self.assertIn("Radarr", msg)
+
+            args, kwargs = mock_urlopen.call_args
+            req = args[0]
+            self.assertEqual(req.headers.get("X-api-key"), "test_radarr_key")
+            payload = json.loads(req.data.decode("utf-8"))
+            self.assertEqual(payload["title"], item["Title"])
+            self.assertEqual(payload["infoHash"], item["InfoHash"])
+
+    def test_parse_time_seconds(self):
+        self.assertEqual(qj.parse_time_seconds("45s"), 45)
+        self.assertEqual(qj.parse_time_seconds("15m"), 900)
+        self.assertEqual(qj.parse_time_seconds("2h"), 7200)
+        self.assertEqual(qj.parse_time_seconds("1d"), 86400)
+        self.assertEqual(qj.parse_time_seconds("invalid"), 1800)
+
+    def test_shell_completions(self):
+        bash = qj.generate_completions("bash")
+        self.assertIn("_qjackett()", bash)
+        self.assertIn("complete -F _qjackett qjackett", bash)
+
+        zsh = qj.generate_completions("zsh")
+        self.assertIn("#compdef qjackett", zsh)
+        self.assertIn("--source", zsh)
+
+        fish = qj.generate_completions("fish")
+        self.assertIn("complete -c qjackett", fish)
+
+
 if __name__ == "__main__":
     unittest.main()
