@@ -588,5 +588,73 @@ class TestV15UIFeatures(unittest.TestCase):
         self.assertTrue(mock_stdout.write.called or True)
 
 
+class TestV16Features(unittest.TestCase):
+    def test_get_tmdb_trailer_url(self):
+        mock_videos = {
+            "results": [
+                {"site": "Vimeo", "key": "123", "type": "Clip"},
+                {"site": "YouTube", "key": "dQw4w9WgXcQ", "type": "Trailer"}
+            ]
+        }
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(mock_videos).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            url = qj.get_tmdb_trailer_url(12345)
+            self.assertEqual(url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    def test_get_free_disk_space(self):
+        qb = qj.QBittorrentClient("http://127.0.0.1:8080")
+        mock_maindata = {"server_state": {"free_space_on_disk": 150000000000}}
+        with patch.object(qb.opener, "open") as mock_open:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(mock_maindata).encode("utf-8")
+            mock_open.return_value.__enter__.return_value = mock_resp
+
+            free = qb.get_free_disk_space()
+            self.assertEqual(free, 150000000000)
+
+    def test_tmdb_trending(self):
+        mock_trending = {
+            "results": [
+                {"title": "Dune 2", "media_type": "movie", "vote_average": 8.4, "release_date": "2024-03-01"},
+                {"name": "Shogun", "media_type": "tv", "vote_average": 8.8, "first_air_date": "2024-02-27"}
+            ]
+        }
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps(mock_trending).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            results = qj.get_tmdb_trending()
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0]["title"], "Dune 2")
+            self.assertEqual(results[1]["name"], "Shogun")
+
+    def test_qbittorrent_categories_and_delete(self):
+        qb = qj.QBittorrentClient("http://127.0.0.1:8080")
+        with patch.object(qb.opener, "open") as mock_open:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({"movies": {}, "tv": {}}).encode("utf-8")
+            mock_resp.status = 200
+            mock_open.return_value.__enter__.return_value = mock_resp
+
+            cats = qb.get_categories()
+            self.assertIn("movies", cats)
+
+            del_ok = qb.delete_torrents(["hash123"], delete_files=True)
+            self.assertTrue(del_ok)
+
+    @patch("subprocess.run")
+    def test_notification_with_image_path(self, mock_run):
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as tf:
+            qj.send_notification("Title", "Body", image_path=tf.name)
+            args, kwargs = mock_run.call_args
+            cmd = args[0]
+            self.assertIn("-i", cmd)
+            self.assertIn(tf.name, cmd)
+
+
 if __name__ == "__main__":
     unittest.main()
