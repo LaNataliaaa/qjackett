@@ -1,6 +1,6 @@
 # Maintainer: LaNataliaaa <33694493+LaNataliaaa@users.noreply.github.com>
 pkgname=qjackett-git
-pkgver=1.4.0
+pkgver=1.5.0
 pkgrel=1
 pkgdesc="A lightning-fast interactive TUI torrent searcher powered by Jackett, BitMagnet and fzf with direct qBittorrent injection"
 arch=('any')
@@ -24,7 +24,7 @@ md5sums=('SKIP')
 
 pkgver() {
     cd "${srcdir}/qjackett"
-    printf "1.4.0.r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    printf "1.5.0.r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 package() {
