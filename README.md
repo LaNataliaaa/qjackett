@@ -12,9 +12,23 @@
 
 ## ✨ Features
 
-- 🚀 **Parallel Multi-Tracker Search:** Queries dozens of Jackett indexers concurrently using a thread pool.
-- 🎯 **Fuzzy Search & Filtering:** Powered by `fzf` — filter titles as you type, or exclude terms easily using `!term`.
+- 🖼️ **TMDB Posters & Spanish Synopses in Terminal:** Automatically fetches official movie/show posters rendered directly inside the preview panel via `chafa`, along with IMDb/TMDB rating and Spanish synopsis.
+- 🎛️ **Selective Files Downloader:** Press `Ctrl + E` to pick and choose specific episodes or files using an interactive multi-select menu before queueing into qBittorrent.
+- ⚡ **Tracker Booster:** Automatically injects verified high-speed public trackers into magnet links, accelerating DHT peer discovery in seconds.
+- 🍿 **Direct *Arr Suite Integration:** Press `Ctrl + R` to send releases directly to Radarr, Sonarr or Lidarr for automated library management and Jellyfin syncing.
+- 💬 **Integrated Subtitles Search:** Press `Ctrl + U` to search and notify matching Spanish subtitles via Bazarr.
+- 🤖 **Background Watcher Mode:** Monitor releases in background (`--watch "Query" --interval 15m`) and auto-inject matching torrents with desktop notifications.
+- 📄 **JSON Stream Output for Scripting:** Pipeline-friendly `--json` flag to integrate `qjackett` with Unix utilities like `jq` or custom scripts.
+- 🐚 **Native Shell Completions:** Autocompletion generator for `bash`, `zsh`, and `fish` (`qjackett --completions [bash|zsh|fish]`).
+- 🚀 **Parallel Multi-Tracker & BitMagnet DHT Search:** Queries dozens of Jackett indexers concurrently alongside local BitMagnet DHT (<15ms latency) with smart InfoHash deduplication.
+- 🎯 **Fuzzy Search & In-TUI Dynamic Filtering:** Filter titles as you type, and switch categories (`F1..F5` / `Alt+1..Alt+4`) or toggle sorting (`Ctrl + S`) in real-time without leaving `fzf`.
 - 🗂️ **Multi-Selection Downloads:** Press `Tab` to select multiple torrents and queue them all into qBittorrent with a single `Enter`.
+- 🎬 **Instant Streaming Prioritization:** Press `Ctrl + V` or use `--stream` to inject torrents with `sequentialDownload` and `firstLastPiecePrio` for immediate streaming in `mpv`.
+- 📁 **Files Tree Inspector:** Press `Ctrl + F` or view the preview panel to inspect files and folder hierarchies before downloading.
+- 🛡️ **Heuristic Malware & Fake Torrent Shield:** Automatically detects suspicious `.exe` payloads in video/audio categories, fake small sizes, inflated swarms, and highlights trusted sources (`🛡️ Verificado`).
+- 📊 **Built-in qBittorrent Live Downloads Monitor:** View active downloads, progress bars, speeds and ETA anytime with `qjackett -d` or pressing `Ctrl + D` in the TUI.
+- ⭐ **Bookmarks & Watchlist System:** Save torrents to your personal watchlist with `Ctrl + B` and manage or batch-download them later via `qjackett -b`.
+- 📜 **Persistent Search History:** Up/Down arrow history in interactive prompt saved to `~/.cache/qjackett/history.txt`.
 - 🔍 **Category & Quality Badges:** Automatic visual classification (🎬 Películas, 📺 Series, 🎌 Anime, 🎮 Juegos, 🎵 Música, 📚 Libros, 💻 Software, 🔞 Adulto).
 - 🏷️ **Smart Metadata & Tech Tags:** Extracts resolution (`4K`, `1080p`, `720p`), source (`Remux`, `BluRay`, `WEB-DL`), codecs (`AV1`, `HEVC/x265`, `x264`), dynamic range (`DV`, `HDR10+`, `HDR`), audio (`Atmos`, `TrueHD`, `DTS-HD`, `FLAC`), and languages (`Dual`, `Castellano`, `Latino`, `VOSE`).
 - ⭐ **Freeleech Detection:** Highlights zero-ratio-cost releases (`⭐ Freeleech`).
