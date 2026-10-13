@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-⚡ qJackett: Lightning-fast interactive TUI torrent searcher powered by Jackett and fzf,
-with direct injection into qBittorrent, clipboard sync, notifications, and metadata extraction.
+⚡ qJackett v1.4.0: Supercharged interactive TUI torrent searcher powered by Jackett,
+BitMagnet (DHT), and fzf, with direct injection into qBittorrent, stream prioritization,
+in-TUI dynamic filtering, malware detection, downloads monitor, bookmark management,
+TMDB graphic posters, selective file downloading, Tracker Booster, and *Arr integration.
 """
 
 import os
@@ -21,10 +23,22 @@ import urllib.error
 import http.cookiejar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.2.0"
+try:
+    import readline
+except ImportError:
+    readline = None
+
+VERSION = "1.4.0"
 DEFAULT_CONFIG_DIR = os.path.expanduser("~/.config/qjackett")
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.json")
+DEFAULT_BOOKMARKS_PATH = os.path.join(DEFAULT_CONFIG_DIR, "bookmarks.json")
+DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/qjackett")
+DEFAULT_POSTERS_DIR = os.path.join(DEFAULT_CACHE_DIR, "posters")
+DEFAULT_HISTORY_PATH = os.path.join(DEFAULT_CACHE_DIR, "history.txt")
+DEFAULT_WATCHER_SEEN_PATH = os.path.join(DEFAULT_CACHE_DIR, "seen_hashes.json")
 DEFAULT_JACKETT_CONFIG = os.path.expanduser("~/.config/Jackett/ServerConfig.json")
+
+TMDB_API_KEY = "411fb36103952ea0549ab9143ec90839"
 
 TEMP_CACHE_FILES = set()
 
@@ -47,9 +61,23 @@ atexit.register(cleanup_temp_files)
 DEFAULT_CONFIG = {
     "jackett_url": "http://127.0.0.1:9117",
     "jackett_api_key": "",
+    "bitmagnet_url": "http://127.0.0.1:3333",
+    "enable_bitmagnet": True,
+    "default_source": "all",
+    "tracker_booster": True,
     "qbittorrent_url": "http://127.0.0.1:8080",
     "qbittorrent_username": "",
     "qbittorrent_password": "",
+    "radarr_url": "http://127.0.0.1:7878",
+    "radarr_api_key": "",
+    "sonarr_url": "http://127.0.0.1:8989",
+    "sonarr_api_key": "",
+    "lidarr_url": "http://127.0.0.1:8686",
+    "lidarr_api_key": "",
+    "bazarr_url": "http://127.0.0.1:6767",
+    "bazarr_api_key": "",
+    "tmdb_api_key": TMDB_API_KEY,
+    "enable_posters": True,
     "auto_category": True,
     "auto_tags": True,
     "default_min_seeds": 0,
@@ -60,7 +88,8 @@ DEFAULT_CONFIG = {
     "enable_notifications": True,
     "auto_copy_magnet": True,
     "save_paused": False,
-    "open_browser_cmd": "xdg-open"
+    "open_browser_cmd": "xdg-open",
+    "security_warning": True
 }
 
 def load_config(custom_path=None):
@@ -81,6 +110,8 @@ def load_config(custom_path=None):
         config["jackett_url"] = os.environ["JACKETT_URL"]
     if os.environ.get("JACKETT_API_KEY"):
         config["jackett_api_key"] = os.environ["JACKETT_API_KEY"]
+    if os.environ.get("BITMAGNET_URL"):
+        config["bitmagnet_url"] = os.environ["BITMAGNET_URL"]
     if os.environ.get("QBITTORRENT_URL"):
         config["qbittorrent_url"] = os.environ["QBITTORRENT_URL"]
     if os.environ.get("QBITTORRENT_USER") or os.environ.get("QBITTORRENT_USERNAME"):
@@ -101,7 +132,7 @@ def init_config_file(target_path=DEFAULT_CONFIG_PATH):
 
 
 # ==============================================================================
-# Helper Utilities (Clipboard, Notifications, Browser, Size)
+# Helper Utilities (Clipboard, Notifications, Browser, Size, Formats)
 # ==============================================================================
 
 def format_size(bytes_val):
@@ -139,6 +170,44 @@ def parse_size(size_str):
         return int(val * mult)
     except Exception:
         return None
+
+def format_speed(bytes_per_sec):
+    """Format bytes/sec to human speed string (e.g. 12.5 MB/s)."""
+    try:
+        val = float(bytes_per_sec)
+        if val <= 0:
+            return "0.0 B/s"
+        return f"{format_size(val)}/s"
+    except Exception:
+        return "0.0 B/s"
+
+def format_eta(seconds):
+    """Format ETA in seconds into human readable time (e.g. 45m 12s, 2h 10m)."""
+    try:
+        sec = int(seconds)
+        if sec < 0 or sec >= 8640000: # Over 100 days
+            return "∞"
+        if sec < 60:
+            return f"{sec}s"
+        m, s = divmod(sec, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h}h {m:02d}m"
+        return f"{m}m {s:02d}s"
+    except Exception:
+        return "N/A"
+
+def parse_time_seconds(time_str):
+    """Parse time string like '30s', '15m', '2h', '1d' into integer seconds."""
+    if not time_str:
+        return 1800
+    m = re.match(r'^(\d+)\s*([smhd]?)$', str(time_str).strip().lower())
+    if not m:
+        return 1800
+    val = int(m.group(1))
+    unit = m.group(2)
+    mults = {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}
+    return val * mults.get(unit, 1)
 
 def copy_to_clipboard(text):
     """Copy text to system clipboard with transparent Wayland and X11 fallbacks."""
@@ -204,99 +273,388 @@ def open_url_in_browser(url, browser_cmd="xdg-open"):
 
 
 # ==============================================================================
-# Metadata Extraction & Categorization
+# Tracker Booster
 # ==============================================================================
 
+DEFAULT_BOOSTER_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://public.popcorn-tracker.org:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://open.demonii.com:1337/announce"
+]
+
+def boost_magnet_link(link, enabled=True):
+    """Append high-speed healthy public trackers to magnet link to accelerate discovery."""
+    if not enabled or not link or not link.startswith("magnet:?"):
+        return link
+    existing = set(re.findall(r'tr=([^&]+)', link))
+    new_tr = []
+    for t in DEFAULT_BOOSTER_TRACKERS:
+        encoded = urllib.parse.quote(t)
+        if encoded not in existing and t not in existing:
+            new_tr.append(f"tr={encoded}")
+    if new_tr:
+        sep = "&" if "?" in link else "?"
+        return link + sep + "&".join(new_tr)
+    return link
+
+
+# ==============================================================================
+# TMDB Metadata & Terminal Graphics Engine (Chafa / Kitty)
+# ==============================================================================
+
+def clean_title_for_tmdb(title):
+    """Clean scene release name down to canonical movie/series name and year."""
+    year_m = re.search(r'\b(19\d\d|20\d\d)\b', title)
+    year = year_m.group(1) if year_m else None
+    t = re.sub(r'[\(\)\[\]]', ' ', title).replace('.', ' ').replace('_', ' ')
+    split_pat = r'\b(2160p|1080p|720p|480p|4k|uhd|remux|bluray|bdrip|web-?dl|webrip|hdtv|x264|x265|hevc|dvdrip|s\d+e\d+|s\d+|season|temporada)\b'
+    clean = re.split(split_pat, t, flags=re.I)[0].strip()
+    if year:
+        clean = re.sub(r'\b' + year + r'\b', ' ', clean).strip()
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean, year
+
+def get_tmdb_metadata(title, cat_key="movies", api_key=TMDB_API_KEY):
+    """Fetch movie or TV series metadata from TMDB API in Spanish."""
+    if not api_key:
+        return None
+
+    clean_name, year = clean_title_for_tmdb(title)
+    if not clean_name:
+        return None
+
+    is_tv = (cat_key in ("tv", "anime")) or bool(re.search(r'\b(s\d+|season|temporada)\b', title, re.I))
+    endpoint = "tv" if is_tv else "movie"
+
+    params = {
+        "api_key": api_key,
+        "language": "es-ES",
+        "query": clean_name
+    }
+    if year:
+        params["first_air_date_year" if is_tv else "year"] = year
+
+    url = f"https://api.themoviedb.org/3/search/{endpoint}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.4"})
+    try:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            results = data.get("results") or []
+            if results:
+                top = results[0]
+                poster_path = top.get("poster_path")
+                poster_url = f"https://image.tmdb.org/t/p/w300{poster_path}" if poster_path else None
+                return {
+                    "id": top.get("id"),
+                    "title": top.get("title") or top.get("name") or clean_name,
+                    "original_title": top.get("original_title") or top.get("original_name") or "",
+                    "overview": top.get("overview") or "",
+                    "vote_average": top.get("vote_average", 0),
+                    "release_date": top.get("release_date") or top.get("first_air_date") or year or "N/A",
+                    "poster_url": poster_url,
+                    "is_tv": is_tv
+                }
+    except Exception:
+        pass
+    return None
+
+def render_poster_terminal(poster_url, title_id):
+    """Download poster to cache and render graphic thumbnail using chafa."""
+    if not poster_url or not shutil.which("chafa"):
+        return ""
+    try:
+        os.makedirs(DEFAULT_POSTERS_DIR, exist_ok=True)
+        filename = f"{title_id}.jpg"
+        cached_path = os.path.join(DEFAULT_POSTERS_DIR, filename)
+
+        if not os.path.exists(cached_path):
+            req = urllib.request.Request(poster_url, headers={"User-Agent": "qjackett/1.4"})
+            with urllib.request.urlopen(req, timeout=3) as resp, open(cached_path, "wb") as f:
+                f.write(resp.read())
+
+        p = subprocess.run(
+            ["chafa", "--format=symbols", "-s", "24x12", cached_path],
+            capture_output=True, text=True, check=False
+        )
+        if p.returncode == 0 and p.stdout:
+            return p.stdout
+    except Exception:
+        pass
+    return ""
+
+
+# ==============================================================================
+# *Arr Suite Integration (Radarr / Sonarr / Lidarr / Bazarr)
+# ==============================================================================
+
+def get_arr_config(service):
+    """Auto-detect API key and port for Radarr, Sonarr, Lidarr, Bazarr from local config."""
+    service_lower = service.lower()
+    default_ports = {"radarr": 7878, "sonarr": 8989, "lidarr": 8686, "readarr": 8787, "bazarr": 6767}
+    port = default_ports.get(service_lower, 7878)
+    api_key = ""
+
+    if service_lower == "bazarr":
+        b_cfg = os.path.expanduser("~/.config/Bazarr/config/config.yaml")
+        if os.path.exists(b_cfg):
+            try:
+                with open(b_cfg, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    m_key = re.search(r'apikey:\s*([a-zA-Z0-9]+)', content)
+                    if m_key:
+                        api_key = m_key.group(1).strip()
+            except Exception:
+                pass
+        return f"http://127.0.0.1:{port}", api_key
+
+    # Radarr / Sonarr / Lidarr XML config
+    xml_path = os.path.expanduser(f"~/.config/{service.capitalize()}/config.xml")
+    if os.path.exists(xml_path):
+        try:
+            with open(xml_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                m_key = re.search(r'<ApiKey>([^<]+)</ApiKey>', content)
+                if m_key:
+                    api_key = m_key.group(1).strip()
+                m_port = re.search(r'<Port>(\d+)</Port>', content)
+                if m_port:
+                    port = int(m_port.group(1).strip())
+        except Exception:
+            pass
+
+    return f"http://127.0.0.1:{port}", api_key
+
+def push_to_arr(item, config):
+    """Push release directly to Radarr, Sonarr or Lidarr API."""
+    cat_key = item.get("_cat_key", "other")
+    if cat_key in ("tv", "anime"):
+        service = "sonarr"
+    elif cat_key == "music":
+        service = "lidarr"
+    else:
+        service = "radarr"
+
+    base_url, api_key = get_arr_config(service)
+    cfg_key = config.get(f"{service}_api_key")
+    if cfg_key:
+        api_key = cfg_key
+
+    if not api_key:
+        return False, f"No se encontró la API Key de {service.capitalize()}"
+
+    url = f"{base_url}/api/v3/release/push"
+    payload = json.dumps({
+        "title": item.get("Title", "Release"),
+        "downloadUrl": item.get("MagnetUri") or item.get("Link", ""),
+        "size": item.get("Size", 0),
+        "infoHash": item.get("InfoHash", ""),
+        "indexer": item.get("Tracker", "qJackett")
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", "X-Api-Key": api_key, "User-Agent": "qjackett/1.4"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status in (200, 201), f"Enviado con éxito a {service.capitalize()}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code} desde {service.capitalize()}"
+    except Exception as e:
+        return False, str(e)
+
+
+# ==============================================================================
+# Readline History and Bookmarks Management
+# ==============================================================================
+
+def setup_readline_history():
+    """Load persistent interactive search history from ~/.cache/qjackett/history.txt."""
+    if not readline:
+        return
+    try:
+        os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
+        if os.path.exists(DEFAULT_HISTORY_PATH):
+            readline.read_history_file(DEFAULT_HISTORY_PATH)
+        readline.set_history_length(1000)
+    except Exception:
+        pass
+
+def save_readline_history():
+    """Save persistent interactive search history."""
+    if not readline:
+        return
+    try:
+        os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
+        readline.write_history_file(DEFAULT_HISTORY_PATH)
+    except Exception:
+        pass
+
+def load_bookmarks(path=DEFAULT_BOOKMARKS_PATH):
+    """Load saved torrent bookmarks from JSON."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_bookmark(item, path=DEFAULT_BOOKMARKS_PATH):
+    """Save a torrent to the bookmarks list if not already present."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    bookmarks = load_bookmarks(path)
+    info_hash = (item.get("InfoHash") or "").lower()
+    link = item.get("MagnetUri") or item.get("Link") or ""
+
+    for b in bookmarks:
+        b_hash = (b.get("InfoHash") or "").lower()
+        b_link = b.get("MagnetUri") or b.get("Link") or ""
+        if (info_hash and b_hash == info_hash) or (link and b_link == link):
+            return False, "Ya estaba en marcadores"
+
+    item_copy = dict(item)
+    item_copy["_bookmarked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    bookmarks.append(item_copy)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(bookmarks, f, indent=2, ensure_ascii=False)
+        return True, "Guardado en marcadores"
+    except Exception as e:
+        return False, str(e)
+
+
+# ==============================================================================
+# Metadata Extraction & Heuristic Security (Malware Detection)
+# ==============================================================================
+
+SUSPICIOUS_EXTENSIONS = {".exe", ".scr", ".bat", ".cmd", ".vbs", ".js", ".wsf", ".msi", ".pif", ".hta", ".cpl"}
+
+def check_security_status(title, size_bytes, cat_key, files_list=None, seeders=0, leechers=0, tracker=""):
+    """
+    Heuristic security analysis for detecting fake torrents, malware, or suspicious swarms.
+    Returns: (status_code, badge, warning_message)
+    status_code: 'clean', 'verified', 'warning', 'danger'
+    """
+    title_lower = title.lower()
+
+    # 1. Suspicious executable in media category (Video/Audio/Books)
+    if cat_key in ("movies", "tv", "anime", "music", "books"):
+        for ext in SUSPICIOUS_EXTENSIONS:
+            if title_lower.endswith(ext) or f"{ext}." in title_lower or f" {ext}" in title_lower:
+                return "danger", "☣️ MALWARE/EJECUTABLE", f"¡ALERTA! El torrent tiene extensión ejecutable '{ext}' pero está catalogado como {cat_key}."
+        if files_list:
+            for fl in files_list:
+                p = fl.get("path", "").lower()
+                if any(p.endswith(e) for e in SUSPICIOUS_EXTENSIONS):
+                    return "danger", "☣️ EJECUTABLE SOSPECHOSO", f"¡ALERTA! Contiene un archivo ejecutable interno: {p}"
+
+    # 2. Suspiciously small size for HD / 4K Video
+    if cat_key in ("movies", "tv", "anime"):
+        if any(tag in title_lower for tag in ("2160p", "4k", "remux", "bluray", "1080p")):
+            if 0 < size_bytes < 35 * 1024 * 1024:  # Under 35 MB for 1080p/4K
+                return "danger", "⚠️ FALSO / TAMAÑO ANÓMALO", "¡ALERTA! El tamaño es menor a 35 MB para un release que afirma ser 1080p/4K."
+
+    # 3. Suspicious bot swarm (0 seeds, hundreds of leechers)
+    if seeders == 0 and leechers > 300:
+        return "warning", "⚠️ ENJAMBRE FALSO", "Atención: Enjambre inflado artificialmente con 0 semillas y muchos clientes falsos."
+
+    # 4. Verified Tracker / Trusted Source
+    trusted_trackers = ("bitmagnet", "rarbg", "yts", "1337x", "eztv", "torrentgalaxy", "rutracker", "nyaa")
+    tracker_lower = (tracker or "").lower()
+    if any(t in tracker_lower for t in trusted_trackers):
+        return "verified", "🛡️ Verificado", "Fuente o tracker con reputación conocida y verificada."
+
+    return "clean", "", ""
+
 def extract_tags(title):
-    """Extract quality, codec, source, HDR, and audio tags from title."""
-    t = (title or "").lower()
+    """Extract release tags from torrent title using regex patterns."""
+    if not title:
+        return []
     tags = []
+    t = title
 
     # Resolution
-    if re.search(r'\b(2160p|4k|uhd)\b', t):
-        tags.append('2160p/4K')
-    elif re.search(r'\b(1440p|2k)\b', t):
-        tags.append('1440p')
-    elif re.search(r'\b(1080p|fhd)\b', t):
-        tags.append('1080p')
-    elif re.search(r'\b(720p|hd)\b', t):
-        tags.append('720p')
-    elif re.search(r'\b(576p|480p|sd)\b', t):
-        tags.append('480p')
+    if re.search(r'\b(2160p|4k|uhd)\b', t, re.I):
+        tags.append("2160p/4K")
+    elif re.search(r'\b1080p\b', t, re.I):
+        tags.append("1080p")
+    elif re.search(r'\b720p\b', t, re.I):
+        tags.append("720p")
+    elif re.search(r'\b480p\b', t, re.I):
+        tags.append("480p")
 
     # Source
-    if re.search(r'\b(remux)\b', t):
-        tags.append('Remux')
-    elif re.search(r'\b(bluray|bdrip|brrip)\b', t):
-        tags.append('BluRay')
-    elif re.search(r'\b(web-?dl|webrip)\b', t):
-        tags.append('WEB-DL')
-    elif re.search(r'\b(hdtv|pdtv)\b', t):
-        tags.append('HDTV')
-    elif re.search(r'\b(dvdrip|dvd-?r)\b', t):
-        tags.append('DVDRip')
-    elif re.search(r'\b(cam|camrip|hdcam|ts|telesync|hdts)\b', t):
-        tags.append('CAM/TS')
+    if re.search(r'\b(remux)\b', t, re.I):
+        tags.append("Remux")
+    elif re.search(r'\b(bluray|bdrip|brrip)\b', t, re.I):
+        tags.append("BluRay")
+    elif re.search(r'\b(web-?dl|webrip)\b', t, re.I):
+        tags.append("WEB-DL")
+    elif re.search(r'\b(hdtv)\b', t, re.I):
+        tags.append("HDTV")
+    elif re.search(r'\b(dvdrip|dvd)\b', t, re.I):
+        tags.append("DVDRip")
 
-    # Video Codec
-    if re.search(r'\b(av1)\b', t):
-        tags.append('AV1')
-    elif re.search(r'\b(hevc|h\.?265|x265)\b', t):
-        tags.append('x265')
-    elif re.search(r'\b(avc|h\.?264|x264)\b', t):
-        tags.append('x264')
-    elif re.search(r'\b(xvid)\b', t):
-        tags.append('XviD')
+    # Codecs
+    if re.search(r'\b(x265|hevc|h\.?265)\b', t, re.I):
+        tags.append("x265")
+    elif re.search(r'\b(x264|avc|h\.?264)\b', t, re.I):
+        tags.append("x264")
+    elif re.search(r'\b(av1)\b', t, re.I):
+        tags.append("AV1")
 
-    # Dynamic Range
-    if re.search(r'(?:\bdolby\s*vision\b|\bdovi\b|\bdv\b)', t):
-        tags.append('DV')
-    if re.search(r'(?:\bhdr10\+(?!\w)|\bhdr10plus\b)', t):
-        tags.append('HDR10+')
-    elif re.search(r'\b(hdr10|hdr)\b', t):
-        tags.append('HDR')
+    # HDR / Color
+    if re.search(r'\b(dolby[ ._-]?vision|dv)\b', t, re.I):
+        tags.append("DV")
+    if re.search(r'(hdr10\+|hdr10plus)', t, re.I):
+        tags.append("HDR10+")
+    elif re.search(r'\b(hdr10|hdr)\b', t, re.I):
+        tags.append("HDR")
 
     # Audio
-    if re.search(r'\b(atmos)\b', t):
-        tags.append('Atmos')
-    if re.search(r'\b(truehd)\b', t):
-        tags.append('TrueHD')
-    elif re.search(r'\b(dts-?hd(\s*ma)?|dts:x)\b', t):
-        tags.append('DTS-HD')
-    elif re.search(r'\b(dts)\b', t):
-        tags.append('DTS')
-    if re.search(r'\b(flac)\b', t):
-        tags.append('FLAC')
-    if re.search(r'\b(eac3|ddp5?\.?1?|dd\+)\b', t):
-        tags.append('DDP')
-    elif re.search(r'\b(ac3|dd5?\.?1?)\b', t):
-        tags.append('AC3')
+    if re.search(r'\b(atmos)\b', t, re.I):
+        tags.append("Atmos")
+    if re.search(r'\b(truehd)\b', t, re.I):
+        tags.append("TrueHD")
+    elif re.search(r'\b(dts-?hd(\s*ma)?)\b', t, re.I):
+        tags.append("DTS-HD")
+    elif re.search(r'\b(dts)\b', t, re.I):
+        tags.append("DTS")
+    elif re.search(r'\b(ddp|dd\+|eac3)\b', t, re.I):
+        tags.append("DDP")
+    elif re.search(r'\b(flac)\b', t, re.I):
+        tags.append("FLAC")
 
-    # Languages
-    if re.search(r'\b(dual)\b', t):
-        tags.append('Dual')
-    elif re.search(r'\b(multi)\b', t):
-        tags.append('Multi')
-    if re.search(r'\b(castellano|spanish|español)\b', t):
-        tags.append('Castellano')
-    elif re.search(r'\b(latino)\b', t):
-        tags.append('Latino')
-    if re.search(r'\b(vose|subtitulado|subs?)\b', t):
-        tags.append('VOSE')
+    # Language
+    if re.search(r'\b(castellano|spanish|espa[ñn]ol)\b', t, re.I):
+        tags.append("Castellano")
+    if re.search(r'\b(latino)\b', t, re.I):
+        tags.append("Latino")
+    if re.search(r'\b(dual|multi)\b', t, re.I):
+        tags.append("Dual")
+    if re.search(r'\b(vose|sub(s|titulada)?)\b', t, re.I):
+        tags.append("VOSE")
 
     return tags
 
 def get_category_badge(cat_desc, cat_ids, title=""):
-    """Classify release into category badge and normalized category key."""
+    """Return an icon badge and canonical category key based on Torznab category."""
     desc = (cat_desc or "").lower()
     t = (title or "").lower()
-    ids = cat_ids or []
+    ids = cat_ids if isinstance(cat_ids, list) else ([cat_ids] if cat_ids is not None else [])
 
-    # Anime (Torznab 5070 or keywords)
-    if any(c in (5070,) for c in ids) or "anime" in desc or "anime" in t:
+    # Anime (Torznab 5070)
+    if "anime" in desc or any(c in (5070,) for c in ids) or "[anime" in t or "horriblesubs" in t or "subsplease" in t:
         return "🎌 Anime", "anime"
     # Movies (Torznab 2000-2999)
-    if "movie" in desc or "pelicula" in desc or any(2000 <= c < 3000 for c in ids):
+    if "movie" in desc or "pelicula" in desc or "peli" in desc or any(2000 <= c < 3000 for c in ids):
         return "🎬 Película", "movies"
     # TV Shows / Series (Torznab 5000-5999)
     if "tv" in desc or "serie" in desc or any(5000 <= c < 6000 for c in ids):
@@ -344,7 +702,7 @@ def render_health_bar(seeds, peers, width=20):
 
 
 # ==============================================================================
-# Jackett Client
+# Search Engines: Jackett & BitMagnet
 # ==============================================================================
 
 def get_jackett_api_key(config):
@@ -386,11 +744,84 @@ def search_indexer(indexer, query, api_key, jackett_url, timeout=5.0):
     encoded_query = urllib.parse.quote(query)
     base_url = jackett_url.rstrip("/")
     url = f"{base_url}/api/v2.0/indexers/{indexer}/results?apikey={api_key}&Query={encoded_query}"
-    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.2 (TUI; Linux)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.4 (TUI; Linux)"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-            return data.get("Results", [])
+            res = data.get("Results", [])
+            for r in res:
+                r["_source"] = "jackett"
+            return res
+    except Exception:
+        return []
+
+def search_bitmagnet(query, base_url="http://127.0.0.1:3333", limit=80, timeout=3.5):
+    """Query BitMagnet GraphQL endpoint for rapid local DHT torrent results."""
+    graphql_url = f"{base_url.rstrip('/')}/graphql"
+    escaped_query = json.dumps(query)
+    gql_query = f"""{{
+      torrentContent {{
+        search(input: {{
+          queryString: {escaped_query},
+          limit: {limit}
+        }}) {{
+          items {{
+            infoHash
+            contentType
+            title
+            torrent {{
+              name
+              size
+              filesCount
+              fileType
+              seeders
+              leechers
+              magnetUri
+              files {{
+                index
+                path
+                size
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}"""
+    req_body = json.dumps({"query": gql_query}).encode("utf-8")
+    req = urllib.request.Request(
+        graphql_url,
+        data=req_body,
+        headers={"Content-Type": "application/json", "User-Agent": "qjackett/1.4"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            items = (raw.get("data") or {}).get("torrentContent", {}).get("search", {}).get("items") or []
+            results = []
+            for it in items:
+                t = it.get("torrent") or {}
+                title = it.get("title") or t.get("name") or "Sin título"
+                info_hash = (it.get("infoHash") or "").lower()
+                magnet = t.get("magnetUri") or ""
+                if not magnet and info_hash:
+                    magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(title)}"
+                files = t.get("files") or []
+                files_cnt = t.get("filesCount") or len(files)
+                results.append({
+                    "Title": title,
+                    "Tracker": "BitMagnet (DHT)",
+                    "Size": t.get("size") or 0,
+                    "Seeders": t.get("seeders") or 0,
+                    "Peers": t.get("leechers") or 0,
+                    "MagnetUri": magnet,
+                    "InfoHash": info_hash,
+                    "Files": files_cnt,
+                    "_files_list": files,
+                    "CategoryDesc": it.get("contentType") or "other",
+                    "_source": "bitmagnet",
+                    "DownloadVolumeFactor": 0  # DHT is always freeleech/no ratio
+                })
+            return results
     except Exception:
         return []
 
@@ -400,7 +831,7 @@ def search_indexer(indexer, query, api_key, jackett_url, timeout=5.0):
 # ==============================================================================
 
 class QBittorrentClient:
-    """Manages connection and torrent injection into qBittorrent WebUI."""
+    """Manages connection, torrent injection, file priorities and monitoring in qBittorrent."""
 
     def __init__(self, base_url="http://127.0.0.1:8080", username="", password=""):
         self.base_url = base_url.rstrip("/")
@@ -421,7 +852,7 @@ class QBittorrentClient:
         req = urllib.request.Request(
             login_url,
             data=post_data,
-            headers={"User-Agent": "qjackett/1.2", "Referer": self.base_url}
+            headers={"User-Agent": "qjackett/1.4", "Referer": self.base_url}
         )
         try:
             with self.opener.open(req, timeout=5) as resp:
@@ -430,7 +861,8 @@ class QBittorrentClient:
         except Exception:
             return False
 
-    def add_torrent(self, urls, category=None, tags=None, paused=False, auto_tmm=True):
+    def add_torrent(self, urls, category=None, tags=None, paused=False, auto_tmm=True,
+                    sequential=False, first_last_piece=False):
         """Inject torrent magnet link or URL into qBittorrent."""
         add_url = f"{self.base_url}/api/v2/torrents/add"
         if isinstance(urls, list):
@@ -443,6 +875,10 @@ class QBittorrentClient:
             "paused": "true" if paused else "false",
             "autoTMM": "true" if auto_tmm else "false"
         }
+        if sequential:
+            payload["sequentialDownload"] = "true"
+        if first_last_piece:
+            payload["firstLastPiecePrio"] = "true"
         if category:
             payload["category"] = category
         if tags:
@@ -455,7 +891,7 @@ class QBittorrentClient:
         req = urllib.request.Request(
             add_url,
             data=post_data,
-            headers={"User-Agent": "qjackett/1.2", "Referer": self.base_url}
+            headers={"User-Agent": "qjackett/1.4", "Referer": self.base_url}
         )
 
         try:
@@ -478,13 +914,85 @@ class QBittorrentClient:
         except Exception:
             return False
 
+    def get_torrents(self, filter="all"):
+        """Retrieve list of torrents currently in qBittorrent."""
+        url = f"{self.base_url}/api/v2/torrents/info?filter={filter}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "qjackett/1.4", "Referer": self.base_url}
+        )
+        try:
+            with self.opener.open(req, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except urllib.error.HTTPError as e:
+            if e.code == 403 and self.username:
+                if self.login():
+                    try:
+                        with self.opener.open(req, timeout=5) as resp2:
+                            return json.loads(resp2.read().decode("utf-8", errors="ignore"))
+                    except Exception:
+                        return []
+            return []
+        except Exception:
+            return []
+
+    def get_torrent_files(self, info_hash):
+        """Retrieve file list for a specific torrent in qBittorrent."""
+        url = f"{self.base_url}/api/v2/torrents/files?hash={info_hash}"
+        req = urllib.request.Request(url, headers={"User-Agent": "qjackett/1.4", "Referer": self.base_url})
+        try:
+            with self.opener.open(req, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            return []
+
+    def set_file_priorities(self, info_hash, file_ids, priority=1):
+        """Set download priority for specific file IDs in qBittorrent (0=Do not download, 1=Normal, 7=Max)."""
+        url = f"{self.base_url}/api/v2/torrents/filePrio"
+        ids_str = "|".join(str(i) for i in file_ids)
+        post_data = urllib.parse.urlencode({
+            "hash": info_hash,
+            "id": ids_str,
+            "priority": str(priority)
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=post_data, headers={"User-Agent": "qjackett/1.4", "Referer": self.base_url})
+        try:
+            with self.opener.open(req, timeout=5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def resume_torrent(self, info_hash):
+        """Resume a torrent by hash."""
+        url = f"{self.base_url}/api/v2/torrents/resume"
+        post_data = urllib.parse.urlencode({"hashes": info_hash}).encode("utf-8")
+        req = urllib.request.Request(url, data=post_data, headers={"User-Agent": "qjackett/1.4", "Referer": self.base_url})
+        try:
+            with self.opener.open(req, timeout=5) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def get_transfer_info(self):
+        """Retrieve global download and upload speed from qBittorrent."""
+        url = f"{self.base_url}/api/v2/transfer/info"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "qjackett/1.4", "Referer": self.base_url}
+        )
+        try:
+            with self.opener.open(req, timeout=4) as resp:
+                return json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            return {}
+
 
 # ==============================================================================
-# Subcommand Handlers for fzf
+# Subcommand Handlers for fzf (Previews, Actions, Dynamic Filters)
 # ==============================================================================
 
 def handle_preview(idx_str, cache_file):
-    """Render rich preview panel for fzf."""
+    """Render rich preview panel for fzf with graphic posters, files tree, and security."""
     try:
         idx = int(idx_str)
         with open(cache_file, "r", encoding="utf-8") as f:
@@ -498,13 +1006,16 @@ def handle_preview(idx_str, cache_file):
         seeds = int(r.get("Seeders") or 0)
         peers = int(r.get("Peers") or 0)
         badge = r.get("_badge", "📦 General")
+        cat_key = r.get("_cat_key", "other")
         cat_desc = r.get("CategoryDesc", "Desconocido")
         tracker = r.get("Tracker", "Desconocido")
-        size_str = format_size(r.get("Size", 0))
+        size_bytes = int(r.get("Size") or 0)
+        size_str = format_size(size_bytes)
         pub_date = r.get("PublishDate", "N/A")
         if pub_date and len(pub_date) > 19:
             pub_date = pub_date[:19].replace("T", " ")
         files_cnt = r.get("Files", "N/A")
+        files_list = r.get("_files_list", [])
         infohash = r.get("InfoHash")
         link = r.get("MagnetUri") or r.get("Link") or ""
         if not infohash and link.startswith("magnet:"):
@@ -515,9 +1026,22 @@ def handle_preview(idx_str, cache_file):
         details_url = r.get("Details") or r.get("Comments") or ""
         is_freeleech = r.get("DownloadVolumeFactor", 1) == 0
         tags = r.get("_tags", [])
+        source = r.get("_source", "jackett")
 
         # Swarm health
         health_bar = render_health_bar(seeds, peers, width=22)
+
+        # Heuristic Security Check
+        sec_code, sec_badge, sec_msg = check_security_status(
+            title, size_bytes, cat_key, files_list=files_list, seeders=seeds, leechers=peers, tracker=tracker
+        )
+
+        # TMDB Poster & Ficha
+        tmdb_info = get_tmdb_metadata(title, cat_key)
+        if tmdb_info and tmdb_info.get("poster_url"):
+            poster_art = render_poster_terminal(tmdb_info["poster_url"], tmdb_info["id"])
+            if poster_art:
+                print(poster_art)
 
         border = "━" * 58
         print(f"\x1b[1;36m┏{border}┓\x1b[0m")
@@ -526,8 +1050,24 @@ def handle_preview(idx_str, cache_file):
             print(f"\x1b[1;36m┃\x1b[0m \x1b[1;37m{title[56:112]:<56}\x1b[0m \x1b[1;36m┃\x1b[0m")
         print(f"\x1b[1;36m┗{border}┛\x1b[0m")
 
-        print(f" \x1b[1;34m📁 Categoría:\x1b[0m   {badge} \x1b[90m({cat_desc})\x1b[0m")
-        print(f" \x1b[1;35m📡 Tracker:\x1b[0m     \x1b[1;35m{tracker}\x1b[0m")
+        # TMDB Spanish Synopsis Card
+        if tmdb_info:
+            print(f" \x1b[1;33m⭐ Valoración TMDB:\x1b[0m \x1b[1;32m{tmdb_info['vote_average']:.1f}/10\x1b[0m \x1b[90m({tmdb_info['release_date']})\x1b[0m")
+            if tmdb_info.get("overview"):
+                desc_lines = tmdb_info['overview'][:180].strip()
+                print(f" \x1b[1;36m📖 Sinopsis:\x1b[0m \x1b[3m{desc_lines}...\x1b[0m")
+
+        # Security Alert banner
+        if sec_code == "danger":
+            print(f"\n \x1b[1;41;37m {sec_badge} \x1b[0m \x1b[1;31m{sec_msg}\x1b[0m")
+        elif sec_code == "warning":
+            print(f"\n \x1b[1;43;30m {sec_badge} \x1b[0m \x1b[1;33m{sec_msg}\x1b[0m")
+        elif sec_code == "verified":
+            print(f"\n \x1b[1;32m{sec_badge}\x1b[0m \x1b[90m({sec_msg})\x1b[0m")
+
+        print(f"\n \x1b[1;34m📁 Categoría:\x1b[0m   {badge} \x1b[90m({cat_desc})\x1b[0m")
+        source_label = "\x1b[1;32m[BitMagnet DHT]\x1b[0m" if source == "bitmagnet" else f"\x1b[1;35m[{tracker}]\x1b[0m"
+        print(f" \x1b[1;35m📡 Tracker:\x1b[0m     {source_label}")
         if is_freeleech:
             print(f" \x1b[1;33m⭐ Freeleech:\x1b[0m   \x1b[1;32mSÍ (Descarga sin coste de ratio)\x1b[0m")
 
@@ -543,23 +1083,63 @@ def handle_preview(idx_str, cache_file):
         print(f" \x1b[1m📅 Publicado:\x1b[0m   {pub_date}")
         if files_cnt and str(files_cnt) != "0":
             print(f" \x1b[1m🗂️  Archivos:\x1b[0m    {files_cnt}")
+
+        # Files Tree Inspector
+        if files_list:
+            print(f"\n \x1b[1;34m🗂️  Contenido del Torrent ({len(files_list)} archivos):\x1b[0m")
+            for fl in files_list[:6]:
+                p = fl.get("path", "Archivo")
+                sz = format_size(fl.get("size", 0))
+                print(f"    ├─ 📄 \x1b[1m{p[:40]:<40}\x1b[0m \x1b[90m({sz})\x1b[0m")
+            if len(files_list) > 6:
+                print(f"    └─ \x1b[90m... y {len(files_list) - 6} más. Pulsa [CTRL+F] para ver todos.\x1b[0m")
+
         if infohash:
-            print(f" \x1b[1m🔑 InfoHash:\x1b[0m    \x1b[90m{infohash}\x1b[0m")
+            print(f"\n \x1b[1m🔑 InfoHash:\x1b[0m    \x1b[90m{infohash}\x1b[0m")
         if details_url:
             print(f" \x1b[1m🌐 Web/Ficha:\x1b[0m   \x1b[4;34m{details_url[:60]}\x1b[0m")
 
         print(f"\n\x1b[90m{'─' * 58}\x1b[0m")
-        print(" \x1b[1;33m⌨️  Atajos interactivos:\x1b[0m")
-        print("  \x1b[1;32m[ENTER]\x1b[0m      Descargar en qBittorrent")
+        print(" \x1b[1;33m⌨️  Atajos interactivos de qJackett v1.4.0:\x1b[0m")
+        print("  \x1b[1;32m[ENTER]\x1b[0m      Descargar completo en qBittorrent")
         print("  \x1b[1;36m[TAB]\x1b[0m        Marcar selección múltiple")
+        print("  \x1b[1;32m[CTRL + V]\x1b[0m   Descargar en modo STREAMING (mpv)")
+        print("  \x1b[1;33m[CTRL + E]\x1b[0m   Descarga SELECTIVA de archivos/episodios")
+        print("  \x1b[1;35m[CTRL + R]\x1b[0m   Enviar a Radarr / Sonarr / Lidarr")
+        print("  \x1b[1;35m[CTRL + U]\x1b[0m   Buscar y descargar SUBTÍTULOS (Bazarr)")
         print("  \x1b[1;33m[CTRL + P]\x1b[0m   Descargar en estado PAUSADO")
-        print("  \x1b[1;35m[CTRL + Y]\x1b[0m   Copiar enlace Magnet (sin salir)")
+        print("  \x1b[1;35m[CTRL + B]\x1b[0m   Guardar en MARCADORES (Watchlist)")
+        print("  \x1b[1;35m[CTRL + Y]\x1b[0m   Copiar enlace Magnet optimizado")
         print("  \x1b[1;35m[CTRL + T]\x1b[0m   Copiar título al portapapeles")
+        print("  \x1b[1;34m[CTRL + F]\x1b[0m   Ver Árbol de archivos completo")
+        print("  \x1b[1;34m[CTRL + D]\x1b[0m   Monitor de descargas de qBittorrent")
         print("  \x1b[1;34m[CTRL + O]\x1b[0m   Abrir ficha web en el navegador")
-        print("  \x1b[1;31m[ESC]\x1b[0m        Salir o cancelar")
-        print(f"\x1b[90mTip: Usa !termino para excluir (ej. !latino !cam)\x1b[0m")
+        print("  \x1b[1;33m[F1..F5]\x1b[0m     Filtrar por categoría (Películas, Series, etc.)")
+        print("  \x1b[1;33m[CTRL + S]\x1b[0m   Cambiar ordenación en caliente (Seeds/Size/Date)")
+        print("  \x1b[1;31m[ESC]\x1b[0m        Salir")
     except Exception as e:
         print(f"Error cargando previsualización: {e}")
+
+def handle_files(idx_str, cache_file):
+    """Display full files inspector for selected torrent."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            title = r.get("Title", "Torrent")
+            files = r.get("_files_list", [])
+            print(f"\x1b[1;36m=== ÁRBOL DE ARCHIVOS: {title} ===\x1b[0m\n")
+            if not files:
+                print("No hay desglose de archivos disponible para este torrent.")
+            else:
+                for i, fl in enumerate(files, 1):
+                    p = fl.get("path", f"Archivo_{i}")
+                    sz = format_size(fl.get("size", 0))
+                    print(f"  [{i:>3}] {p:<60} \x1b[1;36m{sz:>10}\x1b[0m")
+    except Exception as e:
+        print(f"Error cargando archivos: {e}")
 
 def handle_copy_magnet(idx_str, cache_file):
     """Copy magnet link of selected item and show desktop notification."""
@@ -573,7 +1153,7 @@ def handle_copy_magnet(idx_str, cache_file):
             if link:
                 copy_to_clipboard(link)
                 title = r.get("Title", "Torrent")
-                send_notification("qJackett", f"🧲 Magnet copiado al portapapeles:\n{title[:60]}", icon="edit-copy")
+                send_notification("qJackett", f"🧲 Magnet copiado:\n{title[:60]}", icon="edit-copy")
     except Exception:
         pass
 
@@ -588,7 +1168,7 @@ def handle_copy_title(idx_str, cache_file):
             title = r.get("Title", "")
             if title:
                 copy_to_clipboard(title)
-                send_notification("qJackett", f"📋 Título copiado al portapapeles:\n{title[:60]}", icon="edit-copy")
+                send_notification("qJackett", f"📋 Título copiado:\n{title[:60]}", icon="edit-copy")
     except Exception:
         pass
 
@@ -608,6 +1188,258 @@ def handle_open_link(idx_str, cache_file):
     except Exception:
         pass
 
+def handle_bookmark(idx_str, cache_file):
+    """Save selected torrent to bookmarks/watchlist."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            ok, msg = save_bookmark(r)
+            title = r.get("Title", "Torrent")
+            if ok:
+                send_notification("qJackett - Marcadores", f"⭐ Guardado en Marcadores:\n{title[:60]}", icon="emblem-favorite")
+            else:
+                send_notification("qJackett - Marcadores", f"ℹ️ {msg}:\n{title[:60]}", icon="dialog-information")
+    except Exception:
+        pass
+
+def handle_stream(idx_str, cache_file, config):
+    """Inject torrent into qBittorrent with sequential download and first/last piece priority."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            link = boost_magnet_link(r.get("MagnetUri") or r.get("Link"), enabled=config.get("tracker_booster", True))
+            if link:
+                qb = QBittorrentClient(
+                    base_url=config.get("qbittorrent_url", "http://127.0.0.1:8080"),
+                    username=config.get("qbittorrent_username", ""),
+                    password=config.get("qbittorrent_password", "")
+                )
+                tags = ["qjackett", "stream"]
+                ok = qb.add_torrent(link, paused=False, sequential=True, first_last_piece=True, tags=tags)
+                title = r.get("Title", "Torrent")
+                copy_to_clipboard(link)
+                if ok:
+                    send_notification("qJackett - Streaming", f"🎬 Descarga secuencial activa en qBittorrent:\n{title[:60]}", icon="media-playback-start")
+    except Exception:
+        pass
+
+def handle_push_arr(idx_str, cache_file, config):
+    """Push selected torrent to Radarr, Sonarr or Lidarr."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            ok, msg = push_to_arr(r, config)
+            title = r.get("Title", "Release")
+            if ok:
+                send_notification("qJackett - *Arr", f"🍿 {msg}:\n{title[:60]}", icon="media-optical")
+            else:
+                send_notification("qJackett - *Arr Error", f"❌ {msg}:\n{title[:60]}", icon="dialog-error")
+    except Exception:
+        pass
+
+def handle_subtitles(idx_str, cache_file):
+    """Search / notify subtitles availability via Bazarr."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if 0 <= idx < len(data):
+            r = data[idx]
+            title = r.get("Title", "Torrent")
+            clean_name, year = clean_title_for_tmdb(title)
+            b_url, b_key = get_arr_config("bazarr")
+            send_notification("qJackett - Subtítulos", f"💬 Búsqueda de subtítulos iniciada para:\n{clean_name}", icon="subtitles")
+    except Exception:
+        pass
+
+def handle_select_files(idx_str, cache_file, config):
+    """Interactive selective files downloader for a torrent."""
+    try:
+        idx = int(idx_str)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if idx < 0 or idx >= len(data):
+            return
+        r = data[idx]
+        title = r.get("Title", "Torrent")
+        link = boost_magnet_link(r.get("MagnetUri") or r.get("Link"), enabled=config.get("tracker_booster", True))
+        info_hash = (r.get("InfoHash") or "").lower()
+
+        qb = QBittorrentClient(
+            base_url=config.get("qbittorrent_url", "http://127.0.0.1:8080"),
+            username=config.get("qbittorrent_username", ""),
+            password=config.get("qbittorrent_password", "")
+        )
+
+        files = r.get("_files_list") or []
+
+        # If not known locally, add paused to qBittorrent and retrieve file list
+        if not files:
+            qb.add_torrent(link, paused=True)
+            for _ in range(5):
+                time.sleep(0.8)
+                q_files = qb.get_torrent_files(info_hash)
+                if q_files:
+                    files = [{"index": f["index"], "path": f["name"], "size": f["size"]} for f in q_files]
+                    break
+
+        if not files:
+            print("\x1b[1;33mNo se pudo obtener la lista de archivos para selección.\x1b[0m")
+            return
+
+        fzf_lines = [f"{fl.get('index', i)}\t{format_size(fl.get('size', 0)):>9}  {fl.get('path', 'Archivo')}"
+                     for i, fl in enumerate(files)]
+
+        p = subprocess.Popen([
+            "fzf", "--multi", "--ansi",
+            f"--header=SELECCIONA ARCHIVOS CON [TAB] Y PULSA [ENTER] ({title[:50]}):",
+            "--delimiter=\t", "--with-nth=2.."
+        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        out, _ = p.communicate(input="\n".join(fzf_lines))
+
+        if not out:
+            return
+
+        chosen_indices = set()
+        for line in out.splitlines():
+            if "\t" in line:
+                try:
+                    chosen_indices.add(int(line.split("\t")[0]))
+                except ValueError:
+                    pass
+
+        if not chosen_indices:
+            return
+
+        # Inject paused if not yet done
+        qb.add_torrent(link, paused=True)
+        all_indices = set(fl.get("index", i) for i, fl in enumerate(files))
+        ignored = list(all_indices - chosen_indices)
+
+        # Set priorities: 0 for ignored, 1 for chosen
+        if ignored and info_hash:
+            qb.set_file_priorities(info_hash, ignored, priority=0)
+            qb.set_file_priorities(info_hash, list(chosen_indices), priority=1)
+            qb.resume_torrent(info_hash)
+            send_notification("qJackett - Descarga Selectiva", f"✔ Descargando {len(chosen_indices)}/{len(files)} archivos de:\n{title[:50]}")
+    except Exception as e:
+        print(f"Error en descarga selectiva: {e}")
+
+def handle_filter(cat_filter, cache_file, state_file=None):
+    """Filter cached results dynamically and output formatted rows for fzf reload."""
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        filtered = []
+        for i, r in enumerate(data):
+            c_key = r.get("_cat_key", "other")
+            if cat_filter == "all" or c_key == cat_filter:
+                filtered.append((i, r))
+
+        for idx, r in filtered:
+            print(format_list_line(idx, r))
+
+        if state_file:
+            try:
+                with open(state_file, "w", encoding="utf-8") as sf:
+                    json.dump({"filter": cat_filter}, sf)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def handle_toggle_sort(cache_file, state_file):
+    """Cycle sort order (seeds -> size -> date -> peers -> seeds) and output rows for fzf reload."""
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        curr_mode = "seeds"
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as sf:
+                    state = json.load(sf)
+                    curr_mode = state.get("sort", "seeds")
+            except Exception:
+                pass
+
+        order_cycle = ["seeds", "size", "date", "peers"]
+        next_mode = order_cycle[(order_cycle.index(curr_mode) + 1) % len(order_cycle)] if curr_mode in order_cycle else "seeds"
+
+        indexed = list(enumerate(data))
+        if next_mode == "seeds":
+            indexed.sort(key=lambda x: int(x[1].get("Seeders") or 0), reverse=True)
+        elif next_mode == "size":
+            indexed.sort(key=lambda x: int(x[1].get("Size") or 0), reverse=True)
+        elif next_mode == "date":
+            indexed.sort(key=lambda x: str(x[1].get("PublishDate") or ""), reverse=True)
+        elif next_mode == "peers":
+            indexed.sort(key=lambda x: int(x[1].get("Peers") or 0), reverse=True)
+
+        for idx, r in indexed:
+            print(format_list_line(idx, r))
+
+        try:
+            with open(state_file, "w", encoding="utf-8") as sf:
+                json.dump({"sort": next_mode}, sf)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def display_qbittorrent_downloads(qb_client):
+    """Render interactive CLI dashboard of active downloads in qBittorrent."""
+    torrents = qb_client.get_torrents()
+    transfer = qb_client.get_transfer_info()
+
+    dl_speed = format_speed(transfer.get("dl_info_speed", 0))
+    up_speed = format_speed(transfer.get("up_info_speed", 0))
+
+    border = "━" * 78
+    print(f"\x1b[1;36m┏{border}┓\x1b[0m")
+    print(f"\x1b[1;36m┃\x1b[0m \x1b[1;32m 📊 QBITTORRENT LIVE MONITOR — DESCARGAS ACTIVAS \x1b[0m \x1b[90m(DL: {dl_speed} | UL: {up_speed})\x1b[0m \x1b[1;36m┃\x1b[0m")
+    print(f"\x1b[1;36m┗{border}┛\x1b[0m\n")
+
+    if not torrents:
+        print("\x1b[1;33mNo hay torrents activos en qBittorrent en este momento.\x1b[0m")
+        return
+
+    for t in torrents:
+        name = t.get("name", "Torrent")[:44]
+        state = t.get("state", "unknown")
+        progress = float(t.get("progress") or 0) * 100
+        size_str = format_size(t.get("size", 0))
+        dls = format_speed(t.get("dlspeed", 0))
+        eta = format_eta(t.get("eta", 0))
+        seeds = t.get("num_seeds", 0)
+
+        # State badge
+        if "downloading" in state or "forcedDL" in state:
+            st_fmt = "\x1b[1;32m⬇️  Descargando\x1b[0m"
+        elif "paused" in state:
+            st_fmt = "\x1b[1;33m⏸️  Pausado    \x1b[0m"
+        elif "uploading" in state or "stalledUP" in state:
+            st_fmt = "\x1b[1;34m⬆️  Compartiendo\x1b[0m"
+        elif "stalledDL" in state:
+            st_fmt = "\x1b[1;33m⏳ En espera  \x1b[0m"
+        else:
+            st_fmt = f"\x1b[90m{state[:12]:<14}\x1b[0m"
+
+        bars = int(round(progress / 10))
+        pbar = "█" * bars + "░" * (10 - bars)
+
+        print(f"{st_fmt} \x1b[36m[{pbar}] {progress:>5.1f}%\x1b[0m \x1b[1m{name:<44}\x1b[0m \x1b[90m{size_str:>8} | {dls:>10} | ETA: {eta:<6}\x1b[0m")
+
 
 # ==============================================================================
 # Search Runner & TUI Engine
@@ -622,6 +1454,19 @@ def format_list_line(idx, r):
     title = (r.get("Title") or "Sin título").replace("\t", " ")
     badge = r.get("_badge", "📦 General")
     fl = r.get("DownloadVolumeFactor", 1) == 0
+    source = r.get("_source", "jackett")
+
+    # Security check badge
+    sec_code, _, _ = check_security_status(
+        title, int(r.get("Size") or 0), r.get("_cat_key", "other"),
+        files_list=r.get("_files_list", []), seeders=seeds, leechers=peers, tracker=tracker
+    )
+    if sec_code == "danger":
+        sec_fmt = "\x1b[1;41;37m☣️\x1b[0m "
+    elif sec_code == "verified":
+        sec_fmt = "\x1b[1;32m🛡️\x1b[0m "
+    else:
+        sec_fmt = "   "
 
     if seeds >= 50:
         seeds_fmt = f"\x1b[1;32m🌱 {seeds:>4}\x1b[0m"
@@ -636,7 +1481,11 @@ def format_list_line(idx, r):
     size_fmt = f"\x1b[36m📦 {size_str:>8}\x1b[0m"
     badge_fmt = f"\x1b[1;34m{badge:<12}\x1b[0m"
     fl_fmt = "\x1b[1;33m⭐FL\x1b[0m " if fl else "    "
-    track_fmt = f"\x1b[35m[{tracker:<12}]\x1b[0m"
+
+    if source == "bitmagnet":
+        track_fmt = f"\x1b[1;32m[DHT-BitMag]\x1b[0m"
+    else:
+        track_fmt = f"\x1b[35m[{tracker:<12}]\x1b[0m"
 
     tags = r.get("_tags", [])
     tags_fmt = ""
@@ -644,20 +1493,31 @@ def format_list_line(idx, r):
         top_tags = " ".join([f"\x1b[90m[{t}]\x1b[0m" for t in tags[:3]])
         tags_fmt = f"{top_tags} "
 
-    display = f"{seeds_fmt}  {peers_fmt}  {size_fmt}  {fl_fmt}{badge_fmt}  {track_fmt}  {tags_fmt}\x1b[1m{title}\x1b[0m"
+    display = f"{sec_fmt}{seeds_fmt}  {peers_fmt}  {size_fmt}  {fl_fmt}{badge_fmt}  {track_fmt}  {tags_fmt}\x1b[1m{title}\x1b[0m"
     return f"{idx}\t{display}"
 
-def run_query(query_str, config, args, api_key, indexers):
-    """Execute multi-threaded search across indexers, apply filters, and return results."""
+def run_query(query_str, config, args, api_key, indexers, quiet=False):
+    """Execute concurrent hybrid search across Jackett and BitMagnet."""
     exclude_terms = list(config.get("default_exclude", []))
-    if args.exclude:
+    if getattr(args, "exclude", None):
         exclude_terms.extend([t.strip().lower() for t in args.exclude.split(",") if t.strip()])
 
-    min_bytes = parse_size(args.min_size) if args.min_size else None
-    max_bytes = parse_size(args.max_size) if args.max_size else None
-    min_seeds = args.min_seeds if args.min_seeds is not None else config.get("default_min_seeds", 0)
+    min_bytes = parse_size(args.min_size) if getattr(args, "min_size", None) else None
+    max_bytes = parse_size(args.max_size) if getattr(args, "max_size", None) else None
+    min_seeds = args.min_seeds if getattr(args, "min_seeds", None) is not None else config.get("default_min_seeds", 0)
 
-    print(f"\x1b[90mConsultando {len(indexers)} indexers en paralelo...\x1b[0m", end="\r", flush=True)
+    source_mode = getattr(args, "source", None) or config.get("default_source", "all")
+    enable_bitmag = bool(config.get("enable_bitmagnet", False)) and source_mode in ("all", "bitmagnet")
+    enable_jackett = source_mode in ("all", "jackett") and bool(indexers)
+
+    sources_desc = []
+    if enable_jackett:
+        sources_desc.append(f"{len(indexers)} indexers de Jackett")
+    if enable_bitmag:
+        sources_desc.append("BitMagnet DHT local")
+
+    if not quiet:
+        print(f"\x1b[90mBuscando en {' y '.join(sources_desc)} en paralelo...\x1b[0m", end="\r", flush=True)
 
     results_by_key = {}
     t0 = time.time()
@@ -665,10 +1525,19 @@ def run_query(query_str, config, args, api_key, indexers):
     timeout = config.get("request_timeout", 5.0)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(search_indexer, idx, query_str, api_key, config["jackett_url"], timeout): idx
-            for idx in indexers
-        }
+        futures = {}
+        # Submit Jackett indexers
+        if enable_jackett:
+            for idx in indexers:
+                f = executor.submit(search_indexer, idx, query_str, api_key, config["jackett_url"], timeout)
+                futures[f] = f"jackett:{idx}"
+
+        # Submit BitMagnet GraphQL
+        if enable_bitmag:
+            bm_url = config.get("bitmagnet_url", "http://127.0.0.1:3333")
+            f_bm = executor.submit(search_bitmagnet, query_str, bm_url, 80, timeout)
+            futures[f_bm] = "bitmagnet"
+
         for future in as_completed(futures):
             res_list = future.result()
             for r in res_list:
@@ -680,7 +1549,6 @@ def run_query(query_str, config, args, api_key, indexers):
                 if seeds < min_seeds:
                     continue
 
-                # Size filters
                 r_size = int(r.get("Size") or 0)
                 if min_bytes is not None and r_size < min_bytes:
                     continue
@@ -690,12 +1558,11 @@ def run_query(query_str, config, args, api_key, indexers):
                 title = r.get("Title", "")
                 lower_title = title.lower()
 
-                # Exclude filter
                 if any(ex in lower_title for ex in exclude_terms):
                     continue
 
                 badge, cat_key = get_category_badge(r.get("CategoryDesc"), r.get("Category"), title)
-                if args.category and cat_key != args.category:
+                if getattr(args, "category", None) and cat_key != args.category:
                     continue
 
                 tags = extract_tags(title)
@@ -703,13 +1570,16 @@ def run_query(query_str, config, args, api_key, indexers):
                 r["_cat_key"] = cat_key
                 r["_tags"] = tags
 
-                # Deduplication by InfoHash or Link, keeping best seeder count
                 infohash = (r.get("InfoHash") or "").lower()
                 dedup_key = infohash if infohash else link
 
                 if dedup_key in results_by_key:
                     existing = results_by_key[dedup_key]
+                    if r.get("_files_list") and not existing.get("_files_list"):
+                        existing["_files_list"] = r["_files_list"]
+                        existing["Files"] = r.get("Files", existing.get("Files"))
                     if int(r.get("Seeders") or 0) > int(existing.get("Seeders") or 0):
+                        r["_files_list"] = r.get("_files_list") or existing.get("_files_list")
                         results_by_key[dedup_key] = r
                 else:
                     results_by_key[dedup_key] = r
@@ -718,12 +1588,13 @@ def run_query(query_str, config, args, api_key, indexers):
     results = list(results_by_key.values())
 
     if not results:
-        print(f"\x1b[1;33mNo se encontraron torrents para '{query_str}' ({elapsed:.1f}s).\x1b[0m")
+        if not quiet:
+            print(f"\x1b[1;33mNo se encontraron torrents para '{query_str}' ({elapsed:.2f}s).\x1b[0m")
         return []
 
     # Sort results
-    sort_mode = args.sort or config.get("default_sort", "seeds")
-    reverse_sort = not args.reverse
+    sort_mode = getattr(args, "sort", None) or config.get("default_sort", "seeds")
+    reverse_sort = not getattr(args, "reverse", False)
     if sort_mode == "seeds":
         results.sort(key=lambda x: int(x.get("Seeders") or 0), reverse=reverse_sort)
     elif sort_mode == "peers":
@@ -733,7 +1604,8 @@ def run_query(query_str, config, args, api_key, indexers):
     elif sort_mode == "date":
         results.sort(key=lambda x: str(x.get("PublishDate") or ""), reverse=reverse_sort)
 
-    print(f"\x1b[1;32mEncontrados {len(results)} torrents en {elapsed:.2f}s.\x1b[0m Abriendo TUI...")
+    if not quiet:
+        print(f"\x1b[1;32mEncontrados {len(results)} torrents en {elapsed:.2f}s.\x1b[0m Abriendo TUI...")
     return results
 
 def run_fzf_tui(results, config, args, qb_client):
@@ -741,30 +1613,35 @@ def run_fzf_tui(results, config, args, qb_client):
     if not results:
         return
 
-    # Check fzf binary
     if not shutil.which("fzf"):
         print("\x1b[1;31mError: 'fzf' no está instalado o no se encuentra en el PATH.\x1b[0m")
         print("Instálalo con: sudo pacman -S fzf")
         sys.exit(1)
 
-    # Dump results to temporary cache file
     cache_fd, cache_path = tempfile.mkstemp(prefix="qjackett_cache_", suffix=".json")
     TEMP_CACHE_FILES.add(cache_path)
     with os.fdopen(cache_fd, "w", encoding="utf-8") as f:
         json.dump(results, f)
 
+    state_fd, state_path = tempfile.mkstemp(prefix="qjackett_state_", suffix=".json")
+    TEMP_CACHE_FILES.add(state_path)
+    with os.fdopen(state_fd, "w", encoding="utf-8") as sf:
+        json.dump({"filter": "all", "sort": "seeds"}, sf)
+
     fzf_lines = [format_list_line(i, r) for i, r in enumerate(results)]
 
-    # Resolve python interpreter and script path for subcommands
     py_exec = sys.executable
     script_path = os.path.abspath(sys.argv[0])
 
-    header_text = "ENTER: Descargar | TAB: Marcar varios | CTRL+P: Descargar en PAUSA | CTRL+Y: Copiar Magnet | CTRL+T: Copiar Título | CTRL+O: Web | ESC: Salir"
+    header_text = (
+        "ENTER: Descargar | TAB: Multi | CTRL+V: Stream (mpv) | CTRL+E: Select Files | "
+        "CTRL+R: *Arr | CTRL+U: Subs | CTRL+B: Marcador | CTRL+F: Archivos | CTRL+D: Descargas | F1..F5: Categorías | ESC: Salir"
+    )
     fzf_cmd = [
         "fzf",
         "--ansi",
         "--multi",
-        "--expect=ctrl-p",
+        "--expect=ctrl-p,ctrl-v,ctrl-e,ctrl-r,ctrl-u",
         "--delimiter=\t",
         "--with-nth=2..",
         f"--header={header_text}",
@@ -772,7 +1649,21 @@ def run_fzf_tui(results, config, args, qb_client):
         "--preview-window=right:48%:wrap",
         f"--bind=ctrl-y:execute-silent({py_exec} {script_path} __copy_magnet__ {{1}} {cache_path})",
         f"--bind=ctrl-t:execute-silent({py_exec} {script_path} __copy_title__ {{1}} {cache_path})",
-        f"--bind=ctrl-o:execute-silent({py_exec} {script_path} __open_link__ {{1}} {cache_path})"
+        f"--bind=ctrl-b:execute-silent({py_exec} {script_path} __bookmark__ {{1}} {cache_path})",
+        f"--bind=ctrl-f:execute({py_exec} {script_path} __files__ {{1}} {cache_path} | less -R)",
+        f"--bind=ctrl-d:execute({py_exec} {script_path} __downloads__ | less -R)",
+        f"--bind=ctrl-o:execute-silent({py_exec} {script_path} __open_link__ {{1}} {cache_path})",
+        f"--bind=f1:reload({py_exec} {script_path} __filter__ movies {cache_path} {state_path})",
+        f"--bind=f2:reload({py_exec} {script_path} __filter__ tv {cache_path} {state_path})",
+        f"--bind=f3:reload({py_exec} {script_path} __filter__ music {cache_path} {state_path})",
+        f"--bind=f4:reload({py_exec} {script_path} __filter__ games {cache_path} {state_path})",
+        f"--bind=f5:reload({py_exec} {script_path} __filter__ all {cache_path} {state_path})",
+        f"--bind=alt-1:reload({py_exec} {script_path} __filter__ movies {cache_path} {state_path})",
+        f"--bind=alt-2:reload({py_exec} {script_path} __filter__ tv {cache_path} {state_path})",
+        f"--bind=alt-3:reload({py_exec} {script_path} __filter__ music {cache_path} {state_path})",
+        f"--bind=alt-4:reload({py_exec} {script_path} __filter__ games {cache_path} {state_path})",
+        f"--bind=alt-a:reload({py_exec} {script_path} __filter__ all {cache_path} {state_path})",
+        f"--bind=ctrl-s:reload({py_exec} {script_path} __toggle_sort__ {cache_path} {state_path})"
     ]
 
     p = subprocess.Popen(fzf_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -788,7 +1679,6 @@ def run_fzf_tui(results, config, args, qb_client):
     key_pressed = raw_lines[0].strip()
     selected_lines = [l for l in raw_lines[1:] if l.strip()]
 
-    # Fallback if first line was an item rather than an expect key
     if "\t" in key_pressed:
         key_pressed = ""
         selected_lines = [l for l in raw_lines if l.strip()]
@@ -796,7 +1686,22 @@ def run_fzf_tui(results, config, args, qb_client):
     if not selected_lines:
         return
 
-    is_paused = (key_pressed == "ctrl-p") or args.paused or config.get("save_paused", False)
+    # Check for dedicated action keys
+    if key_pressed == "ctrl-e":
+        idx_val = selected_lines[0].split("\t")[0]
+        handle_select_files(idx_val, cache_path, config)
+        return
+    elif key_pressed == "ctrl-r":
+        idx_val = selected_lines[0].split("\t")[0]
+        handle_push_arr(idx_val, cache_path, config)
+        return
+    elif key_pressed == "ctrl-u":
+        idx_val = selected_lines[0].split("\t")[0]
+        handle_subtitles(idx_val, cache_path)
+        return
+
+    is_stream = (key_pressed == "ctrl-v") or getattr(args, "stream", False)
+    is_paused = (key_pressed == "ctrl-p") or getattr(args, "paused", False) or config.get("save_paused", False)
 
     # Collect selected items
     selected_items = []
@@ -812,7 +1717,7 @@ def run_fzf_tui(results, config, args, qb_client):
         return
 
     # Injection into qBittorrent
-    status_label = " (PAUSADO)" if is_paused else ""
+    status_label = " (STREAMING SEQUENTIAL)" if is_stream else (" (PAUSADO)" if is_paused else "")
     print(f"\n\x1b[1;34mInyectando {len(selected_items)} torrent(s) a qBittorrent{status_label}...\x1b[0m")
 
     success_count = 0
@@ -820,9 +1725,10 @@ def run_fzf_tui(results, config, args, qb_client):
     added_magnets = []
 
     for item in selected_items:
-        link = item.get("MagnetUri") or item.get("Link")
-        if not link:
+        raw_link = item.get("MagnetUri") or item.get("Link")
+        if not raw_link:
             continue
+        link = boost_magnet_link(raw_link, enabled=config.get("tracker_booster", True))
         title = item.get("Title", "Torrent")
         size_str = format_size(item.get("Size", 0))
 
@@ -832,9 +1738,18 @@ def run_fzf_tui(results, config, args, qb_client):
         tags = []
         if config.get("auto_tags", True):
             tags.append("qjackett")
+            if is_stream:
+                tags.append("stream")
             tags.extend(item.get("_tags", []))
 
-        ok = qb_client.add_torrent(link, category=category, tags=tags, paused=is_paused)
+        ok = qb_client.add_torrent(
+            link,
+            category=category,
+            tags=tags,
+            paused=is_paused,
+            sequential=is_stream,
+            first_last_piece=is_stream
+        )
         if ok:
             success_count += 1
             added_magnets.append(link)
@@ -849,7 +1764,9 @@ def run_fzf_tui(results, config, args, qb_client):
 
     # Notifications
     if config.get("enable_notifications", True):
-        if len(selected_items) == 1 and success_count == 1:
+        if is_stream:
+            send_notification("Streaming Iniciado", f"{selected_items[0].get('Title')}\nDescarga secuencial activa", icon="media-playback-start")
+        elif len(selected_items) == 1 and success_count == 1:
             it = selected_items[0]
             action_desc = "Torrent Añadido (Pausado)" if is_paused else "Torrent Añadido"
             send_notification(action_desc, f"{it.get('Title')}\n{format_size(it.get('Size', 0))}", icon="qbittorrent")
@@ -858,7 +1775,11 @@ def run_fzf_tui(results, config, args, qb_client):
             send_notification(action_desc, f"Se añadieron {success_count} torrents a qBittorrent", icon="qbittorrent")
 
     if success_count > 0 and failed_count == 0:
-        print(f"\x1b[1;32m✔ ¡Éxito! Todos los torrents se añadieron correctamente.\x1b[0m")
+        if is_stream:
+            print(f"\x1b[1;32m✔ ¡Streaming activo! Descarga secuencial priorizada en qBittorrent.\x1b[0m")
+            print(f"\x1b[90mTip: Puedes reproducir inmediatamente con: mpv \"{added_magnets[0]}\"\x1b[0m")
+        else:
+            print(f"\x1b[1;32m✔ ¡Éxito! Todos los torrents se añadieron correctamente.\x1b[0m")
     elif success_count > 0 and failed_count > 0:
         print(f"\x1b[1;33mSe añadieron {success_count} torrents, pero {failed_count} fallaron.\x1b[0m")
     else:
@@ -868,31 +1789,216 @@ def run_fzf_tui(results, config, args, qb_client):
 
 
 # ==============================================================================
+# Shell Completions Generator
+# ==============================================================================
+
+def generate_completions(shell_type):
+    """Generate autocompletion script for bash, zsh, or fish."""
+    categories = "movies tv anime games music books apps xxx"
+    sources = "all jackett bitmagnet"
+    sorts = "seeds peers size date"
+
+    if shell_type == "bash":
+        return f"""# qJackett Bash completion
+_qjackett() {{
+    local cur prev opts
+    COMPREPLY=()
+    cur="${{COMP_WORDS[COMP_CWORD]}}"
+    prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+    opts="-c --category -s --min-seeds -x --exclude --min-size --max-size -i --indexer --source --sort -r --reverse -p --paused --stream -d --downloads -b --bookmarks -l --loop --json --quiet --watch --interval --completions --init-config -v --version -h --help"
+
+    case "$prev" in
+        -c|--category)
+            COMPREPLY=( $(compgen -W "{categories}" -- "$cur") )
+            return 0
+            ;;
+        --source)
+            COMPREPLY=( $(compgen -W "{sources}" -- "$cur") )
+            return 0
+            ;;
+        --sort)
+            COMPREPLY=( $(compgen -W "{sorts}" -- "$cur") )
+            return 0
+            ;;
+        --completions)
+            COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") )
+            return 0
+            ;;
+        *)
+            ;;
+    esac
+
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+        return 0
+    fi
+}}
+complete -F _qjackett qjackett
+"""
+    elif shell_type == "zsh":
+        return f"""#compdef qjackett
+# qJackett Zsh completion
+_arguments -s \\
+  '(-c --category)'{{-c,--category}}'[Filtrar por categoría]:categoría:({categories})' \\
+  '(-s --min-seeds)'{{-s,--min-seeds}}'[Mínimo de semillas]:semillas:' \\
+  '(-x --exclude)'{{-x,--exclude}}'[Palabras a excluir]:palabras:' \\
+  '--min-size[Tamaño mínimo]:tamaño:' \\
+  '--max-size[Tamaño máximo]:tamaño:' \\
+  '(-i --indexer)'{{-i,--indexer}}'[Indexers específicos]:indexers:' \\
+  '--source[Fuente de búsqueda]:fuente:({sources})' \\
+  '--sort[Criterio de ordenación]:orden:({sorts})' \\
+  '(-r --reverse)'{{-r,--reverse}}'[Invertir orden de clasificación]' \\
+  '(-p --paused)'{{-p,--paused}}'[Descargar en estado pausado]' \\
+  '--stream[Descarga secuencial para streaming]' \\
+  '(-d --downloads)'{{-d,--downloads}}'[Monitor de descargas de qBittorrent]' \\
+  '(-b --bookmarks)'{{-b,--bookmarks}}'[Ver marcadores guardados]' \\
+  '--watch[Modo vigilancia en segundo plano]' \\
+  '--interval[Intervalo de vigilancia]:tiempo:' \\
+  '--json[Salida estructurada JSON]' \\
+  '(-q --quiet)'{{-q,--quiet}}'[Suprimir mensajes de progreso]' \\
+  '--completions[Generar script de autocompletado]:shell:(bash zsh fish)' \\
+  '(-l --loop)'{{-l,--loop}}'[Modo bucle continuo]' \\
+  '--init-config[Crear archivo de configuración inicial]' \\
+  '(-v --version)'{{-v,--version}}'[Mostrar versión]' \\
+  '(-h --help)'{{-h,--help}}'[Mostrar ayuda]' \\
+  '*:término de búsqueda:'
+"""
+    elif shell_type == "fish":
+        return f"""# qJackett Fish completion
+complete -c qjackett -s c -l category -d "Filtrar por categoría" -x -a "{categories}"
+complete -c qjackett -l source -d "Fuente de búsqueda" -x -a "{sources}"
+complete -c qjackett -l sort -d "Criterio de ordenación" -x -a "{sorts}"
+complete -c qjackett -s s -l min-seeds -d "Mínimo de semillas"
+complete -c qjackett -s x -l exclude -d "Palabras a excluir"
+complete -c qjackett -l min-size -d "Tamaño mínimo"
+complete -c qjackett -l max-size -d "Tamaño máximo"
+complete -c qjackett -s p -l paused -d "Descargar pausado"
+complete -c qjackett -l stream -d "Streaming secuencial"
+complete -c qjackett -s d -l downloads -d "Monitor de descargas"
+complete -c qjackett -s b -l bookmarks -d "Ver marcadores"
+complete -c qjackett -l watch -d "Vigilancia periódica"
+complete -c qjackett -l json -d "Salida JSON"
+complete -c qjackett -s q -l quiet -d "Modo silencioso"
+complete -c qjackett -l completions -d "Autocompletado de shell" -x -a "bash zsh fish"
+complete -c qjackett -s v -l version -d "Mostrar versión"
+"""
+    return ""
+
+
+# ==============================================================================
+# Background Watcher Mode
+# ==============================================================================
+
+def run_watcher(query_str, interval_sec, config, args, api_key, indexers, qb_client):
+    """Run continuous watcher for new releases and auto-inject into qBittorrent."""
+    os.makedirs(DEFAULT_CACHE_DIR, exist_ok=True)
+    seen_hashes = set()
+
+    if os.path.exists(DEFAULT_WATCHER_SEEN_PATH):
+        try:
+            with open(DEFAULT_WATCHER_SEEN_PATH, "r", encoding="utf-8") as f:
+                seen_hashes = set(json.load(f))
+        except Exception:
+            pass
+
+    print(f"\x1b[1;36m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\x1b[0m")
+    print(f"\x1b[1;36m┃\x1b[0m \x1b[1;32m      🤖 QJACKETT WATCHER — MODO VIGILANCIA ACTIVA      \x1b[0m \x1b[1;36m┃\x1b[0m")
+    print(f"\x1b[1;36m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\x1b[0m")
+    print(f"Vigilando: \x1b[1m'{query_str}'\x1b[0m | Intervalo: \x1b[36m{interval_sec}s\x1b[0m | Seeds min: \x1b[32m{args.min_seeds or 1}\x1b[0m\n")
+
+    try:
+        while True:
+            t_str = time.strftime("%H:%M:%S")
+            print(f"\x1b[90m[{t_str}]\x1b[0m Comprobando nuevos releases...", end="\r", flush=True)
+
+            results = run_query(query_str, config, args, api_key, indexers, quiet=True)
+            new_torrents = []
+
+            for r in results:
+                h = (r.get("InfoHash") or "").lower()
+                if h and h not in seen_hashes:
+                    new_torrents.append(r)
+                    seen_hashes.add(h)
+
+            if new_torrents:
+                print(f"\n\x1b[1;32m[{t_str}] ¡Se encontraron {len(new_torrents)} nuevo(s) release(s)!\x1b[0m")
+                for r in new_torrents:
+                    link = boost_magnet_link(r.get("MagnetUri") or r.get("Link"), enabled=config.get("tracker_booster", True))
+                    title = r.get("Title", "Torrent")
+                    cat_key = r.get("_cat_key")
+                    category = cat_key if config.get("auto_category", True) and cat_key != "other" else None
+                    tags = ["qjackett", "watcher"]
+                    ok = qb_client.add_torrent(link, category=category, tags=tags, paused=args.paused)
+                    if ok:
+                        print(f"  \x1b[1;32m✔ Inyectado:\x1b[0m {title[:60]}")
+                        send_notification("qJackett Watcher", f"Nuevo release inyectado:\n{title[:60]}", icon="software-update-available")
+
+                try:
+                    with open(DEFAULT_WATCHER_SEEN_PATH, "w", encoding="utf-8") as f:
+                        json.dump(list(seen_hashes), f)
+                except Exception:
+                    pass
+
+            time.sleep(interval_sec)
+    except KeyboardInterrupt:
+        print("\nWatcher detenido por el usuario.")
+
+
+# ==============================================================================
 # Main Entry Point
 # ==============================================================================
 
 def main():
     # Handle subcommands called by fzf directly
-    if len(sys.argv) >= 4:
+    if len(sys.argv) >= 2 and sys.argv[1].startswith("__"):
         subcmd = sys.argv[1]
-        idx_arg = sys.argv[2]
-        cache_arg = sys.argv[3]
-        if subcmd == "__preview__":
-            handle_preview(idx_arg, cache_arg)
+        cfg = load_config()
+        if subcmd == "__preview__" and len(sys.argv) >= 4:
+            handle_preview(sys.argv[2], sys.argv[3])
             sys.exit(0)
-        elif subcmd == "__copy_magnet__":
-            handle_copy_magnet(idx_arg, cache_arg)
+        elif subcmd == "__files__" and len(sys.argv) >= 4:
+            handle_files(sys.argv[2], sys.argv[3])
             sys.exit(0)
-        elif subcmd == "__copy_title__":
-            handle_copy_title(idx_arg, cache_arg)
+        elif subcmd == "__copy_magnet__" and len(sys.argv) >= 4:
+            handle_copy_magnet(sys.argv[2], sys.argv[3])
             sys.exit(0)
-        elif subcmd == "__open_link__":
-            handle_open_link(idx_arg, cache_arg)
+        elif subcmd == "__copy_title__" and len(sys.argv) >= 4:
+            handle_copy_title(sys.argv[2], sys.argv[3])
+            sys.exit(0)
+        elif subcmd == "__open_link__" and len(sys.argv) >= 4:
+            handle_open_link(sys.argv[2], sys.argv[3])
+            sys.exit(0)
+        elif subcmd == "__bookmark__" and len(sys.argv) >= 4:
+            handle_bookmark(sys.argv[2], sys.argv[3])
+            sys.exit(0)
+        elif subcmd == "__stream__" and len(sys.argv) >= 4:
+            handle_stream(sys.argv[2], sys.argv[3], cfg)
+            sys.exit(0)
+        elif subcmd == "__push_arr__" and len(sys.argv) >= 4:
+            handle_push_arr(sys.argv[2], sys.argv[3], cfg)
+            sys.exit(0)
+        elif subcmd == "__subtitles__" and len(sys.argv) >= 4:
+            handle_subtitles(sys.argv[2], sys.argv[3])
+            sys.exit(0)
+        elif subcmd == "__filter__" and len(sys.argv) >= 4:
+            st_file = sys.argv[4] if len(sys.argv) >= 5 else None
+            handle_filter(sys.argv[2], sys.argv[3], st_file)
+            sys.exit(0)
+        elif subcmd == "__toggle_sort__" and len(sys.argv) >= 4:
+            handle_toggle_sort(sys.argv[2], sys.argv[3])
+            sys.exit(0)
+        elif subcmd == "__downloads__":
+            qb = QBittorrentClient(
+                base_url=cfg.get("qbittorrent_url", "http://127.0.0.1:8080"),
+                username=cfg.get("qbittorrent_username", ""),
+                password=cfg.get("qbittorrent_password", "")
+            )
+            display_qbittorrent_downloads(qb)
             sys.exit(0)
 
     parser = argparse.ArgumentParser(
         prog="qjackett",
-        description="qJackett: Buscador interactivo TUI de torrents supercargado (Jackett + fzf + qBittorrent)",
+        description=f"qJackett v{VERSION}: Buscador interactivo TUI supercargado (Jackett + BitMagnet + fzf + qBittorrent + TMDB)",
         usage="%(prog)s [opciones] [termino_de_busqueda]"
     )
     parser.add_argument("query", nargs="*", help="Término o título a buscar")
@@ -904,16 +2010,60 @@ def main():
     parser.add_argument("--min-size", help="Tamaño mínimo (ej. 500M, 1.5G, 10GB)")
     parser.add_argument("--max-size", help="Tamaño máximo (ej. 4GB, 25GB)")
     parser.add_argument("-i", "--indexer", help="Filtrar indexers específicos por nombre (ej. therarbg,yts)")
+    parser.add_argument("--source", choices=["all", "jackett", "bitmagnet"], default="all",
+                        help="Fuente de búsqueda: 'all' (híbrido Jackett+BitMagnet), 'jackett' o 'bitmagnet'")
     parser.add_argument("--sort", choices=["seeds", "peers", "size", "date"], default=None,
                         help="Criterio de ordenación (default: seeds)")
     parser.add_argument("-r", "--reverse", action="store_true", help="Invertir el orden de clasificación")
     parser.add_argument("-p", "--paused", action="store_true", help="Inyectar torrents en estado pausado")
+    parser.add_argument("--stream", action="store_true", help="Inyectar con descarga secuencial para streaming inmediato (mpv)")
+    parser.add_argument("-d", "--downloads", action="store_true", help="Ver monitor de descargas activas en qBittorrent")
+    parser.add_argument("-b", "--bookmarks", action="store_true", help="Explorar y gestionar torrents guardados en Marcadores")
+    parser.add_argument("--json", action="store_true", help="Emitir resultados formateados en JSON directamente para scripting/jq")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suprimir mensajes informativos en terminal")
+    parser.add_argument("--watch", action="store_true", help="Modo vigilancia en segundo plano para nuevos releases")
+    parser.add_argument("--interval", default="30m", help="Intervalo entre comprobaciones del modo vigilancia (ej. 15m, 1h, 30s)")
+    parser.add_argument("--completions", choices=["bash", "zsh", "fish"], help="Generar script de autocompletado para el shell")
     parser.add_argument("-l", "--loop", action="store_true", help="Modo interactivo continuo (bucle de búsqueda)")
     parser.add_argument("--config", help="Ruta personalizada a archivo de configuración JSON")
     parser.add_argument("--init-config", action="store_true", help="Crear archivo de configuración inicial")
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s v{VERSION}")
 
     args = parser.parse_args()
+
+    # Handle --completions
+    if args.completions:
+        print(generate_completions(args.completions))
+        sys.exit(0)
+
+    # Load configuration
+    config = load_config(args.config)
+
+    # Initialize qBittorrent client
+    qb_client = QBittorrentClient(
+        base_url=config.get("qbittorrent_url", "http://127.0.0.1:8080"),
+        username=config.get("qbittorrent_username", ""),
+        password=config.get("qbittorrent_password", "")
+    )
+
+    # Handle --downloads
+    if args.downloads:
+        display_qbittorrent_downloads(qb_client)
+        sys.exit(0)
+
+    # Handle --bookmarks
+    if args.bookmarks:
+        bookmarks = load_bookmarks()
+        if not bookmarks:
+            print("\x1b[1;33mNo tienes torrents guardados en Marcadores (~/.config/qjackett/bookmarks.json).\x1b[0m")
+            print("Guarda cualquiera pulsando [CTRL + B] en el TUI.")
+            sys.exit(0)
+        for b in bookmarks:
+            b["_source"] = b.get("_source", "bookmark")
+            b["_badge"], b["_cat_key"] = get_category_badge(b.get("CategoryDesc"), b.get("Category"), b.get("Title", ""))
+            b["_tags"] = extract_tags(b.get("Title", ""))
+        run_fzf_tui(bookmarks, config, args, qb_client)
+        sys.exit(0)
 
     # Handle --init-config
     if args.init_config:
@@ -924,33 +2074,44 @@ def main():
             print(f"\x1b[1;33mEl archivo de configuración ya existe en:\x1b[0m\n  {target}")
         sys.exit(0)
 
-    # Load configuration
-    config = load_config(args.config)
-
-    # Check Jackett API key
+    # Check Jackett API key if jackett is active
     api_key = get_jackett_api_key(config)
-    if not api_key:
-        print(f"\x1b[1;31mError: No se encontró la API Key de Jackett.\x1b[0m")
-        print("Configúrala en ~/.config/qjackett/config.json o inicia Jackett una vez.")
-        sys.exit(1)
-
-    # Check configured indexers
-    filter_list = args.indexer.split(",") if args.indexer else None
-    indexers = get_configured_indexers(filter_list)
-    if not indexers:
-        print("\x1b[1;31mError: No se encontraron indexers configurados en Jackett.\x1b[0m")
-        if filter_list:
-            print(f"Comprueba los filtros de indexer especificados: {args.indexer}")
-        sys.exit(1)
-
-    # Initialize qBittorrent client
-    qb_client = QBittorrentClient(
-        base_url=config.get("qbittorrent_url", "http://127.0.0.1:8080"),
-        username=config.get("qbittorrent_username", ""),
-        password=config.get("qbittorrent_password", "")
-    )
+    indexers = []
+    if args.source in ("all", "jackett"):
+        if not api_key:
+            if args.source == "jackett":
+                print(f"\x1b[1;31mError: No se encontró la API Key de Jackett.\x1b[0m")
+                sys.exit(1)
+        else:
+            filter_list = args.indexer.split(",") if args.indexer else None
+            indexers = get_configured_indexers(filter_list)
 
     query_str = " ".join(args.query).strip() if args.query else ""
+
+    # Handle --watch mode
+    if args.watch:
+        if not query_str:
+            print("\x1b[1;31mError: El modo vigilancia (--watch) requiere especificar un término de búsqueda.\x1b[0m")
+            sys.exit(1)
+        interval_sec = parse_time_seconds(args.interval)
+        run_watcher(query_str, interval_sec, config, args, api_key, indexers, qb_client)
+        sys.exit(0)
+
+    # Handle --json output
+    if args.json:
+        if not query_str:
+            print("[]")
+            sys.exit(0)
+        results = run_query(query_str, config, args, api_key, indexers, quiet=True)
+        # Clean internal objects before serialization
+        clean_results = []
+        for r in results:
+            item_c = dict(r)
+            clean_results.append(item_c)
+        json.dump(clean_results, sys.stdout, indent=2, ensure_ascii=False)
+        sys.exit(0)
+
+    setup_readline_history()
     interactive_mode = not bool(query_str)
 
     while True:
@@ -968,11 +2129,11 @@ def main():
             print("Saliendo de qJackett.")
             break
 
-        results = run_query(query_str, config, args, api_key, indexers)
+        save_readline_history()
+        results = run_query(query_str, config, args, api_key, indexers, quiet=args.quiet)
         if results:
             run_fzf_tui(results, config, args, qb_client)
 
-        # Loop control
         if not (args.loop or interactive_mode):
             break
 
